@@ -48,65 +48,55 @@ struct TimedTrade {
 // ── Indicator state ────────────────────────────────────────────────────────
 
 struct VwapState {
-    cum_vol: f64,
-    cum_pv: f64,
-    prices: VecDeque<f64>,
+    /// Rolling 5-minute window: (price, volume, timestamp_ms).
+    entries: VecDeque<(f64, f64, u64)>,
 }
 
 impl VwapState {
     fn new() -> Self {
         Self {
-            cum_vol: 0.0,
-            cum_pv: 0.0,
-            prices: VecDeque::new(),
+            entries: VecDeque::new(),
         }
     }
 
-    fn update(&mut self, price: f64, vol: f64) {
-        self.cum_vol += vol;
-        self.cum_pv += price * vol;
-        self.prices.push_back(price);
-        // keep a rolling window for std-dev calculation (last 200 ticks)
-        if self.prices.len() > 200 {
-            self.prices.pop_front();
+    fn update(&mut self, price: f64, vol: f64, timestamp_ms: u64) {
+        self.entries.push_back((price, vol, timestamp_ms));
+        // Drop entries older than 5 minutes.
+        let cutoff_ms = timestamp_ms.saturating_sub(5 * 60 * 1_000);
+        while let Some(&(_, _, ts)) = self.entries.front() {
+            if ts < cutoff_ms {
+                self.entries.pop_front();
+            } else {
+                break;
+            }
         }
     }
 
     fn vwap(&self) -> f64 {
-        if self.cum_vol == 0.0 {
-            return 0.0;
-        }
-        self.cum_pv / self.cum_vol
+        let (cum_pv, cum_vol) = self.entries.iter().fold(
+            (0.0f64, 0.0f64),
+            |(pv, v), &(p, vol, _)| (pv + p * vol, v + vol),
+        );
+        if cum_vol == 0.0 { 0.0 } else { cum_pv / cum_vol }
     }
 
     fn std_dev(&self) -> f64 {
-        let n = self.prices.len() as f64;
+        let n = self.entries.len() as f64;
         if n < 2.0 {
             return 0.0;
         }
-        let mean = self.prices.iter().sum::<f64>() / n;
-        let var = self.prices.iter().map(|p| (p - mean).powi(2)).sum::<f64>() / (n - 1.0);
+        let mean = self.entries.iter().map(|&(p, _, _)| p).sum::<f64>() / n;
+        let var = self.entries.iter().map(|&(p, _, _)| (p - mean).powi(2)).sum::<f64>() / (n - 1.0);
         var.sqrt()
     }
 
-    /// Returns Some(signal_text) if price deviates > 1.5σ from VWAP
-    fn check_signal(&self, price: f64) -> Option<String> {
+    fn z_score(&self, price: f64) -> f64 {
         let vwap = self.vwap();
         let sd = self.std_dev();
         if vwap == 0.0 || sd == 0.0 {
-            return None;
+            return 0.0;
         }
-        let deviation = (price - vwap).abs();
-        if deviation > 1.5 * sd {
-            let side = if price > vwap { "ABOVE" } else { "BELOW" };
-            return Some(format!(
-                "⚠️  VWAP: Price ${:.2} is {side} VWAP ${:.2} by {:.1}σ — mean-reversion risk",
-                price,
-                vwap,
-                deviation / sd,
-            ));
-        }
-        None
+        (price - vwap) / sd
     }
 }
 
@@ -185,21 +175,21 @@ impl RsiState {
 // ── Order Flow Delta ───────────────────────────────────────────────────────
 
 struct DeltaState {
-    cumulative_delta: f64,
-    prev_block_delta: f64,
-    prev_block_price: f64,
-    block_open_price: f64,
-    trade_count: u64,
+    /// Net delta accumulating in the current 15-second window.
+    window_delta: f64,
+    /// Price at the start of the current 15-second window.
+    window_open_price: f64,
+    /// Completed windows: (net_delta, open_price, close_price); keeps last 4
+    /// (= 1 minute of lookback).
+    completed_windows: VecDeque<(f64, f64, f64)>,
 }
 
 impl DeltaState {
     fn new() -> Self {
         Self {
-            cumulative_delta: 0.0,
-            prev_block_delta: 0.0,
-            prev_block_price: 0.0,
-            block_open_price: 0.0,
-            trade_count: 0,
+            window_delta: 0.0,
+            window_open_price: 0.0,
+            completed_windows: VecDeque::new(),
         }
     }
 
@@ -207,47 +197,44 @@ impl DeltaState {
         // is_sell == true  → market SELL (negative delta)
         // is_sell == false → market BUY  (positive delta)
         if is_sell {
-            self.cumulative_delta -= qty;
+            self.window_delta -= qty;
         } else {
-            self.cumulative_delta += qty;
+            self.window_delta += qty;
         }
-        self.trade_count += 1;
-        if self.trade_count == 1 {
-            self.block_open_price = price;
+        // Record the open price on the first trade of this window.
+        if self.window_open_price == 0.0 {
+            self.window_open_price = price;
         }
     }
 
-    fn reset_block(&mut self, current_price: f64) {
-        self.prev_block_delta = self.cumulative_delta;
-        self.prev_block_price = current_price;
-        self.cumulative_delta = 0.0;
-        self.block_open_price = current_price;
-        self.trade_count = 0;
+    /// Called at each 15-second checkpoint to finalise the current window.
+    fn finalize_window(&mut self, close_price: f64) {
+        self.completed_windows.push_back((
+            self.window_delta,
+            self.window_open_price,
+            close_price,
+        ));
+        if self.completed_windows.len() > 4 {
+            self.completed_windows.pop_front();
+        }
+        self.window_delta = 0.0;
+        self.window_open_price = close_price;
     }
 
-    /// Returns Some(signal_text) if bullish/bearish divergence is detected
-    fn check_signal(&self, current_price: f64) -> Option<String> {
-        if self.prev_block_price == 0.0 {
-            return None;
-        }
-        let price_up = current_price > self.prev_block_price;
-        let price_down = current_price < self.prev_block_price;
-        let delta_up = self.cumulative_delta > self.prev_block_delta;
-        let delta_down = self.cumulative_delta < self.prev_block_delta;
+    /// Returns the net delta accumulated in the current (not-yet-finalised) window.
+    fn current_delta(&self) -> f64 {
+        self.window_delta
+    }
 
-        if price_up && delta_down {
-            return Some(format!(
-                "🔶 BEARISH DIVERGENCE: Price ↑ ${:.2} but delta ↓ {:.3} — absorption (sellers absorbing buyers)",
-                current_price, self.cumulative_delta
-            ));
-        }
-        if price_down && delta_up {
-            return Some(format!(
-                "🔶 BULLISH DIVERGENCE: Price ↓ ${:.2} but delta ↑ {:.3} — accumulation (buyers absorbing sellers)",
-                current_price, self.cumulative_delta
-            ));
-        }
-        None
+    /// Returns true if the most recently completed window shows divergence
+    /// (price direction opposite to delta direction).
+    fn check_divergence(&self) -> bool {
+        let Some(&(delta, open, close)) = self.completed_windows.back() else {
+            return false;
+        };
+        let price_up = close > open;
+        let price_down = close < open;
+        (price_up && delta < 0.0) || (price_down && delta > 0.0)
     }
 }
 
@@ -289,19 +276,6 @@ impl BollingerState {
         let upper = mean + 2.0 * sd;
         let lower = mean - 2.0 * sd;
         Some((upper - lower) / mean)
-    }
-
-    /// Returns Some(signal_text) when band width < 0.05% (squeeze)
-    fn check_signal(&self) -> Option<String> {
-        let bw = self.band_width()?;
-        if bw < 0.0005 {
-            Some(format!(
-                "⚠️  BB SQUEEZE: Band width {:.4}% < 0.05% — explosive breakout imminent!",
-                bw * 100.0
-            ))
-        } else {
-            None
-        }
     }
 }
 
@@ -427,10 +401,6 @@ fn seconds_into_block() -> u64 {
     now.timestamp() as u64 % 60
 }
 
-fn is_danger_zone() -> bool {
-    seconds_into_block() >= 44
-}
-
 // ── Application state ──────────────────────────────────────────────────────
 
 struct AppState {
@@ -441,10 +411,9 @@ struct AppState {
     sell_wall: SellWallState,
 
     current_price: f64,
-    current_minute: u32,
     trade_count: u64,
-    /// Per-block trade counter used for danger-zone cadence.
-    block_trade_count: u64,
+    /// 5-second tick counter, used to determine 15-second checkpoints.
+    tick_count: u64,
     /// Rolling 60-second trade buffer for volume-weighted average.
     rolling_trades: VecDeque<TimedTrade>,
     /// Most recently calculated 60-second rolling average (kept for "Stale" display).
@@ -463,28 +432,17 @@ impl AppState {
             sell_wall: SellWallState::new(),
 
             current_price: 0.0,
-            current_minute: 0,
             trade_count: 0,
-            block_trade_count: 0,
+            tick_count: 0,
             rolling_trades: VecDeque::new(),
             rolling_60s_avg: 0.0,
             prev_5s_price: 0.0,
         }
     }
 
-    fn maybe_reset_block(&mut self) {
-        let minute = Utc::now().timestamp() as u32 / 60;
-        if minute != self.current_minute {
-            // Fallback state reset when a trade crosses a minute boundary before
-            // the clock-driven timer has had a chance to fire.
-            self.current_minute = minute;
-            self.vwap = VwapState::new();
-            self.delta.reset_block(self.current_price);
-            self.block_trade_count = 0;
-        }
-    }
-
-    /// Process a `match` message from the Coinbase `matches` channel.
+    /// Process a `match` message: silently update state, no printing.
+    /// RSI and Bollinger are updated at 5-second candle closes (in `on_tick`),
+    /// not on every individual trade.
     fn handle_match(&mut self, price_str: &str, size_str: &str, side: &str) {
         let price: f64 = price_str.parse().unwrap_or(0.0);
         let qty: f64 = size_str.parse().unwrap_or(0.0);
@@ -492,94 +450,47 @@ impl AppState {
             return;
         }
 
-        self.maybe_reset_block();
         self.current_price = price;
         self.trade_count += 1;
-        self.block_trade_count += 1;
 
         // Record trade in the rolling buffer.
         let now_ms = Utc::now().timestamp_millis() as u64;
         self.rolling_trades.push_back(TimedTrade { price, volume: qty, timestamp_ms: now_ms });
 
-        // Update per-minute indicators.
-        self.vwap.update(price, qty);
-        self.rsi.update(price);
+        // Update rolling-window VWAP and current 15-second order flow delta.
+        self.vwap.update(price, qty, now_ms);
         // Coinbase: side "sell" → taker was a seller → negative delta
         self.delta.update(price, qty, side == "sell");
-        self.bollinger.update(price);
-
-        // Periodic RSI hook check.
-        let rsi_signal = self.rsi.check_signal();
-
-        // Danger zone logic.
-        if is_danger_zone() {
-            let sec = seconds_into_block();
-            let remaining = 60u64.saturating_sub(sec);
-
-            // Print danger zone header once per 10-trade cadence in the zone.
-            if self.block_trade_count % 10 == 0 {
-                println!("🔴 DANGER ZONE — Second {}/60 — Last {} seconds!", sec, remaining);
-            }
-
-            // Gather all active signals.
-            let mut signals: Vec<String> = Vec::new();
-
-            if let Some(s) = self.vwap.check_signal(price) {
-                signals.push(s);
-            }
-            if let Some(s) = rsi_signal {
-                signals.push(s);
-            }
-            if let Some(s) = self.delta.check_signal(price) {
-                signals.push(s);
-            }
-            if let Some(s) = self.bollinger.check_signal() {
-                signals.push(s);
-            }
-            if let Some(s) = self.sell_wall.check_signal() {
-                signals.push(s.to_string());
-            }
-
-            for s in &signals {
-                println!("{s}");
-            }
-
-            if signals.len() >= 2 {
-                println!(
-                    "\n🚨🚨🚨 MULTIPLE REVERSAL SIGNALS ({}/5)! DO NOT ENTER even at 95% probability! 🚨🚨🚨\n",
-                    signals.len()
-                );
-            }
-        } else if let Some(s) = rsi_signal {
-            // Still print RSI hooks outside the danger zone.
-            println!("{s}");
-        }
     }
 
-    /// Called on every 5-second tick. Evicts stale rolling trades, recalculates
-    /// the 60-second average, and returns the formatted status line.
-    fn on_tick(&mut self) -> Option<String> {
+    /// Called on every 5-second tick. Updates 5-second candle-based indicators,
+    /// evicts stale rolling trades, recalculates the 60-second average, and
+    /// returns the formatted output lines (always a price line, plus a signal
+    /// summary line every 15 seconds).
+    fn on_tick(&mut self) -> Vec<String> {
+        let mut output = Vec::new();
+
         if self.current_price == 0.0 {
-            return None;
+            return output;
         }
 
+        self.tick_count += 1;
         let now = Utc::now();
         let ts = now.format("%H:%M:%S");
         let now_ms = now.timestamp_millis() as u64;
 
+        // Update 5-second candle-based indicators with the current close price.
+        self.rsi.update(self.current_price);
+        self.bollinger.update(self.current_price);
+
         // Evict trades older than 60 seconds from the rolling buffer.
         let cutoff_ms = now_ms.saturating_sub(60_000);
-        while let Some(front) = self.rolling_trades.front() {
-            if front.timestamp_ms < cutoff_ms {
-                self.rolling_trades.pop_front();
-            } else {
-                break;
-            }
+        while self.rolling_trades.front().map_or(false, |t| t.timestamp_ms < cutoff_ms) {
+            self.rolling_trades.pop_front();
         }
 
         // Calculate the 60-second volume-weighted average.
         let avg_str = if self.rolling_trades.is_empty() {
-            // No trades in the last 60 s — show last known value with a warning.
             if self.rolling_60s_avg > 0.0 {
                 format!("{} ⚠️ Stale", format_usd(self.rolling_60s_avg))
             } else {
@@ -596,13 +507,6 @@ impl AppState {
             format_usd(self.rolling_60s_avg)
         };
 
-        let vwap = self.vwap.vwap();
-        let vwap_str = if vwap > 0.0 {
-            format!(" | VWAP: {}", format_usd(vwap))
-        } else {
-            String::new()
-        };
-
         let delta_str = if self.prev_5s_price > 0.0 {
             let delta_5s = self.current_price - self.prev_5s_price;
             format!(" | Δ5s: {}", format_usd_change(delta_5s))
@@ -612,10 +516,88 @@ impl AppState {
 
         self.prev_5s_price = self.current_price;
 
-        Some(format!(
-            "💰 [{ts}] BTC Price: {} | 60s Avg: {avg_str}{vwap_str}{delta_str}",
+        // Price line — printed every 5 seconds.
+        output.push(format!(
+            "💰 [{ts}] BTC: {} | 60s Avg: {avg_str}{delta_str}",
             format_usd(self.current_price)
-        ))
+        ));
+
+        // Signal check — printed every 15 seconds (every 3rd tick).
+        if self.tick_count % 3 == 0 {
+            let price = self.current_price;
+
+            // Get current window delta before finalising.
+            let delta_val = self.delta.current_delta();
+            // Finalise the 15-second delta window.
+            self.delta.finalize_window(price);
+            // Evaluate sell wall at the 15-second checkpoint.
+            self.sell_wall.update_signal(price);
+
+            // Collect signal values.
+            let rsi_val = self.rsi.rsi(2);
+            let rsi_signal = self.rsi.check_signal();
+            let divergence = self.delta.check_divergence();
+            let bb_width = self.bollinger.band_width();
+            let bb_squeeze = bb_width.map_or(false, |w| w < 0.0005);
+            let vwap_z = self.vwap.z_score(price);
+            let vwap_warn = vwap_z.abs() > 1.5;
+            let sell_wall_sig = self.sell_wall.check_signal().map(|s| s.to_string());
+
+            // Count active warnings.
+            let mut warn_count = 0usize;
+            if rsi_signal.is_some() { warn_count += 1; }
+            if divergence { warn_count += 1; }
+            if bb_squeeze { warn_count += 1; }
+            if vwap_warn { warn_count += 1; }
+            if sell_wall_sig.is_some() { warn_count += 1; }
+
+            // Danger zone: last 15 seconds of the minute (:45 checkpoint).
+            let is_danger = seconds_into_block() >= 45;
+
+            let signal_line = if is_danger && warn_count >= 2 {
+                let mut parts: Vec<String> = Vec::new();
+                if let Some(s) = rsi_signal {
+                    parts.push(s);
+                }
+                let sign = if delta_val >= 0.0 { "+" } else { "" };
+                parts.push(format!("Delta: {sign}{:.2}", delta_val));
+                if vwap_warn {
+                    parts.push(format!("VWAP Z: {:.1}", vwap_z));
+                }
+                if let Some(sw) = sell_wall_sig {
+                    parts.push(sw);
+                }
+                format!(
+                    "   🚨 [DANGER ZONE] {} — {warn_count}/5 DO NOT ENTER!",
+                    parts.join(" | ")
+                )
+            } else {
+                let rsi_str = rsi_val.map_or("N/A".to_string(), |r| format!("{:.1}", r));
+                let sign = if delta_val >= 0.0 { "+" } else { "" };
+                let div_tag = if divergence { " (DIVERGENCE)" } else { "" };
+                let bb_str = bb_width.map_or("N/A".to_string(), |w| {
+                    let sq_tag = if bb_squeeze { " (SQUEEZE)" } else { "" };
+                    format!("{:.2}%{sq_tag}", w * 100.0)
+                });
+                let content = format!(
+                    "RSI: {rsi_str} | Delta: {sign}{:.2}{div_tag} | BB Width: {bb_str} | VWAP Z: {:.1}",
+                    delta_val, vwap_z
+                );
+                if warn_count == 0 {
+                    format!("   📈 [SIGNAL CHECK] {content} — ✅ No warnings")
+                } else {
+                    let sw_part = sell_wall_sig
+                        .as_deref()
+                        .map_or(String::new(), |s| format!(" | {s}"));
+                    let plural = if warn_count == 1 { "" } else { "s" };
+                    format!("   ⚠️ [SIGNAL CHECK] {content}{sw_part} — {warn_count} warning{plural}")
+                }
+            };
+
+            output.push(signal_line);
+        }
+
+        output
     }
 }
 
@@ -683,9 +665,8 @@ async fn main() {
                             }
                             Ok(CoinbaseMessage::L2Update { changes }) => {
                                 state.sell_wall.apply_changes(&changes);
-                                if state.current_price > 0.0 {
-                                    state.sell_wall.update_signal(state.current_price);
-                                }
+                                // Sell wall signal is evaluated at the 15-second
+                                // checkpoint, not on every depth update.
                             }
                             _ => {}
                         }
@@ -700,7 +681,7 @@ async fn main() {
                 }
             }
             _ = ticker.tick() => {
-                if let Some(line) = state.on_tick() {
+                for line in state.on_tick() {
                     println!("{line}");
                 }
             }
