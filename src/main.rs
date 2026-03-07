@@ -400,32 +400,10 @@ impl AppState {
     }
 
     fn maybe_reset_block(&mut self) {
-        let now = Utc::now();
-        let minute = now.timestamp() as u32 / 60;
+        let minute = Utc::now().timestamp() as u32 / 60;
         if minute != self.current_minute {
-            if self.current_minute != 0 {
-                let ts = now.format("%H:%M:%S");
-                let prev_vwap = self.vwap.vwap();
-                let vwap_str = if prev_vwap > 0.0 {
-                    format!(" | VWAP (prev): {}", format_usd(prev_vwap))
-                } else {
-                    String::new()
-                };
-                let change_str = if self.prev_block_close_price > 0.0 {
-                    let diff = self.current_price - self.prev_block_close_price;
-                    format!(" | Change: {}", format_usd_change(diff))
-                } else {
-                    String::new()
-                };
-                println!(
-                    "\n💰 [{ts}] BTC Price: {}{vwap_str}{change_str}",
-                    format_usd(self.current_price)
-                );
-                println!(
-                    "── New 1-min block #{minute} — resetting VWAP & delta state ──"
-                );
-                self.prev_block_close_price = self.current_price;
-            }
+            // Fallback state reset when a trade crosses a minute boundary before
+            // the clock-driven timer has had a chance to fire.
             self.current_minute = minute;
             self.vwap = VwapState::new();
             self.delta.reset_block(self.current_price);
@@ -562,6 +540,16 @@ async fn main() {
 
     let mut state = AppState::new();
 
+    // ── Clock-driven 1-minute timer ──────────────────────────────────────────
+    // Sleep until the next :00 second boundary so the interval fires at
+    // exactly XX:XX:00 on every subsequent tick.
+    let now = Utc::now();
+    let secs_until_next_min = 60 - (now.timestamp().rem_euclid(60) as u64);
+    tokio::time::sleep(tokio::time::Duration::from_secs(secs_until_next_min)).await;
+    // `interval` fires immediately on the first `tick()` call, which happens
+    // right at the minute boundary we just slept to, then every 60 s after.
+    let mut minute_timer = tokio::time::interval(tokio::time::Duration::from_secs(60));
+
     println!("📡 Streaming live data — watching for reversals…\n");
 
     loop {
@@ -597,6 +585,41 @@ async fn main() {
                     }
                     _ => {}
                 }
+            }
+            _ = minute_timer.tick() => {
+                let now = Utc::now();
+                let ts = now.format("%H:%M:%S");
+
+                if state.current_price > 0.0 {
+                    let vwap = state.vwap.vwap();
+                    let vwap_str = if vwap > 0.0 {
+                        format!(" | VWAP: {}", format_usd(vwap))
+                    } else {
+                        String::new()
+                    };
+
+                    let suffix = if state.block_trade_count == 0 {
+                        " | ⚠️ No new trades".to_string()
+                    } else if state.prev_block_close_price > 0.0 {
+                        let diff = state.current_price - state.prev_block_close_price;
+                        format!(" | Change: {}", format_usd_change(diff))
+                    } else {
+                        String::new()
+                    };
+
+                    println!(
+                        "\n💰 [{ts}] BTC Price: {}{vwap_str}{suffix}",
+                        format_usd(state.current_price)
+                    );
+                }
+
+                // Reset block state for the new minute.
+                state.prev_block_close_price = state.current_price;
+                let minute = now.timestamp() as u32 / 60;
+                state.current_minute = minute;
+                state.vwap = VwapState::new();
+                state.delta.reset_block(state.current_price);
+                state.block_trade_count = 0;
             }
         }
     }
