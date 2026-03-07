@@ -324,6 +324,34 @@ impl SellWallState {
     }
 }
 
+// ── Formatting helpers ─────────────────────────────────────────────────────
+
+/// Formats an absolute USD value as `$X,XXX.XX` with comma-separated thousands.
+fn format_usd(value: f64) -> String {
+    let abs_val = value.abs();
+    let cents = (abs_val * 100.0).round() as u64;
+    let whole = cents / 100;
+    let frac = (cents % 100) as u32;
+
+    let whole_str = whole.to_string();
+    let len = whole_str.len();
+    let mut comma_str = String::new();
+    for (i, ch) in whole_str.chars().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            comma_str.push(',');
+        }
+        comma_str.push(ch);
+    }
+
+    format!("${comma_str}.{frac:02}")
+}
+
+/// Formats a signed USD change as `+$X,XXX.XX` or `-$X,XXX.XX`.
+fn format_usd_change(value: f64) -> String {
+    let sign = if value >= 0.0 { "+" } else { "-" };
+    format!("{sign}{}", format_usd(value.abs()))
+}
+
 // ── Timing helpers ─────────────────────────────────────────────────────────
 
 /// Returns how many seconds we are into the current 1-minute block (0–59).
@@ -350,6 +378,8 @@ struct AppState {
     trade_count: u64,
     // per-block trade counter used for status prints
     block_trade_count: u64,
+    // closing price of the previous 1-minute block (for change calculation)
+    prev_block_close_price: f64,
 }
 
 impl AppState {
@@ -365,6 +395,7 @@ impl AppState {
             current_minute: 0,
             trade_count: 0,
             block_trade_count: 0,
+            prev_block_close_price: 0.0,
         }
     }
 
@@ -373,9 +404,27 @@ impl AppState {
         let minute = now.timestamp() as u32 / 60;
         if minute != self.current_minute {
             if self.current_minute != 0 {
+                let ts = now.format("%H:%M:%S");
+                let prev_vwap = self.vwap.vwap();
+                let vwap_str = if prev_vwap > 0.0 {
+                    format!(" | VWAP (prev): {}", format_usd(prev_vwap))
+                } else {
+                    String::new()
+                };
+                let change_str = if self.prev_block_close_price > 0.0 {
+                    let diff = self.current_price - self.prev_block_close_price;
+                    format!(" | Change: {}", format_usd_change(diff))
+                } else {
+                    String::new()
+                };
                 println!(
-                    "\n── New 1-min block #{minute} — resetting VWAP & delta state ──"
+                    "\n💰 [{ts}] BTC Price: {}{vwap_str}{change_str}",
+                    format_usd(self.current_price)
                 );
+                println!(
+                    "── New 1-min block #{minute} — resetting VWAP & delta state ──"
+                );
+                self.prev_block_close_price = self.current_price;
             }
             self.current_minute = minute;
             self.vwap = VwapState::new();
