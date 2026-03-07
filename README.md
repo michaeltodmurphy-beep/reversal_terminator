@@ -1,19 +1,19 @@
 # Reversal Terminator 🚀
 
-A real-time **BTC/USD reversal detection system** written in Rust that connects to Binance WebSocket streams and monitors the **1-minute chart**. It uses 5 technical signals to flag last-minute reversals — designed for binary options trading (e.g. [Kalshi](https://kalshi.com)).
+A real-time **BTC/USD reversal detection system** written in Rust that connects to the **Coinbase Exchange WebSocket** and monitors the live BTC-USD market. It uses 5 technical signals to flag last-minute reversals — designed for binary options trading (e.g. [Kalshi](https://kalshi.com)).
 
 ---
 
 ## What it does
 
-The system monitors two live Binance WebSocket feeds:
+The system opens a single connection to the **Coinbase Exchange WebSocket** (`wss://ws-feed.exchange.coinbase.com`) and subscribes to two channels:
 
-| Stream | Purpose |
+| Channel | Purpose |
 |---|---|
-| `btcusdt@aggTrade` | Real-time trade price, quantity, and buy/sell side |
-| `btcusdt@depth20@100ms` | Level-2 order book snapshots (top 20 bids & asks) |
+| `matches` | Real-time trade price, size, and buy/sell side |
+| `level2_batch` | Level-2 order book snapshot + incremental updates |
 
-Every 1-minute block is analysed for signs that the current trend is about to **reverse**. When 2 or more indicators fire simultaneously inside the **danger zone** (last 16 seconds of the block), a prominent `DO NOT ENTER` warning is printed.
+Every **5 seconds** the current price, 60-second rolling volume-weighted average, VWAP, and 5-second price change are printed. When 2 or more indicators fire simultaneously inside the **danger zone** (last 16 seconds of the 1-minute block), a prominent `DO NOT ENTER` warning is printed.
 
 ---
 
@@ -32,7 +32,7 @@ A very short (2-period) Relative Strength Index that reacts almost instantly to 
 - RSI was ≤ 5 and is now rising → **selling exhaustion**
 
 ### 3. Order Flow Delta — Cumulative Delta 🔶
-Tracks the running sum of buy volume minus sell volume using the `is_buyer_maker` flag from the aggTrade stream.
+Tracks the running sum of buy volume minus sell volume using the `side` field from the `matches` channel.
 
 **Signal**: Divergence between price direction and delta direction:
 - Price rising but delta falling → **bearish absorption** (sellers absorbing buyers)
@@ -72,18 +72,17 @@ During the danger zone:
 ## Sample Output
 
 ```
-🚀 Reversal Terminator — BTC/USD 1-min chart monitor starting…
-   Connecting to Binance WebSocket streams…
+🚀 Reversal Terminator — BTC/USD monitor starting…
+   Connecting to Coinbase Exchange WebSocket…
 
-✅ Connected to wss://stream.binance.us:9443/ws/btcusdt@aggTrade
-✅ Connected to wss://stream.binance.us:9443/ws/btcusdt@depth20@100ms
+✅ Connected to wss://ws-feed.exchange.coinbase.com
 📡 Streaming live data — watching for reversals…
 
-📊 BTC: $96423.10 | VWAP: $96418.55 | Delta: 1.243 | Sec: 12/60
-📊 BTC: $96441.20 | VWAP: $96425.80 | Delta: 2.891 | Sec: 24/60
+💰 [19:31:05] BTC Price: $67,243.26 | 60s Avg: $67,240.15 | VWAP: $67,238.90 | Δ5s: +$3.11
+💰 [19:31:10] BTC Price: $67,255.56 | 60s Avg: $67,242.80 | VWAP: $67,241.20 | Δ5s: +$12.30
 🔴 DANGER ZONE — Second 44/60 — Last 16 seconds!
-⚠️  VWAP: Price $96512.00 is ABOVE VWAP $96425.80 by 2.1σ — mean-reversion risk
-🔶 BEARISH DIVERGENCE: Price ↑ $96512.00 but delta ↓ 0.412 — absorption (sellers absorbing buyers)
+⚠️  VWAP: Price $67,512.00 is ABOVE VWAP $67,425.80 by 2.1σ — mean-reversion risk
+🔶 BEARISH DIVERGENCE: Price ↑ $67,512.00 but delta ↓ 0.412 — absorption (sellers absorbing buyers)
 
 🚨🚨🚨 MULTIPLE REVERSAL SIGNALS (2/5)! DO NOT ENTER even at 95% probability! 🚨🚨🚨
 ```
@@ -120,11 +119,15 @@ cargo build --release
 cargo run --release
 ```
 
-> **Note**: This application connects to **Binance.US** (`stream.binance.us`) by default, which works from US-based servers. Non-US users can switch back to the global endpoints by replacing the stream URLs in `src/main.rs`:
-> ```
-> wss://stream.binance.com:9443/ws/btcusdt@aggTrade
-> wss://stream.binance.com:9443/ws/btcusdt@depth20@100ms
-> ```
+> **Note**: This application connects to **Coinbase Exchange** (`wss://ws-feed.exchange.coinbase.com`), which is fully available in the US with no regional restrictions. No API keys are required — the feed is public.
+
+---
+
+## Update Interval & Rolling Average
+
+- Status is printed every **5 seconds**.
+- **60-second rolling average** (`60s Avg`) is a volume-weighted average of all trades in the last 60 seconds. If no trades have occurred in that window, the last known value is shown with a `⚠️ Stale` warning.
+- **Δ5s** shows the price change since the previous 5-second tick.
 
 ---
 
@@ -132,7 +135,7 @@ cargo run --release
 
 At the start of each new 1-minute block:
 - **Reset**: VWAP accumulator, cumulative delta, per-block trade counter
-- **Carry over**: RSI price history, Bollinger price history (for indicator continuity)
+- **Carry over**: RSI price history, Bollinger price history (for indicator continuity), rolling 60-second trade buffer (spans minute boundaries by design)
 
 ---
 
