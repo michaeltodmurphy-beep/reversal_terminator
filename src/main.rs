@@ -98,6 +98,28 @@ impl VwapState {
         }
         (price - vwap) / sd
     }
+
+    /// Returns a score 0.0–2.0 for VWAP deviation (standard deviations from VWAP).
+    ///
+    /// - 0.0 = within 0.5σ
+    /// - 0.5 = 0.5–1.0σ
+    /// - 1.0 = 1.0–1.5σ
+    /// - 1.5 = 1.5–2.0σ
+    /// - 2.0 = > 2.0σ
+    fn score_vwap_deviation(&self, price: f64) -> f64 {
+        let z = self.z_score(price).abs();
+        if z > 2.0 {
+            2.0
+        } else if z > 1.5 {
+            1.5
+        } else if z > 1.0 {
+            1.0
+        } else if z > 0.5 {
+            0.5
+        } else {
+            0.0
+        }
+    }
 }
 
 // ── Fast RSI (2-period) ────────────────────────────────────────────────────
@@ -147,28 +169,44 @@ impl RsiState {
         Some(100.0 - 100.0 / (1.0 + rs))
     }
 
-    /// Returns Some(signal_text) on RSI hook detection, updates prev_rsi
-    fn check_signal(&mut self) -> Option<String> {
-        let current_rsi = self.rsi(2)?;
-        let result = if let Some(prev) = self.prev_rsi {
-            if prev >= 95.0 && current_rsi < prev {
-                Some(format!(
-                    "🚨 RSI HOOK DOWN: RSI {:.1} → {:.1} — buying exhaustion detected!",
-                    prev, current_rsi
-                ))
-            } else if prev <= 5.0 && current_rsi > prev {
-                Some(format!(
-                    "🚨 RSI HOOK UP: RSI {:.1} → {:.1} — selling exhaustion detected!",
-                    prev, current_rsi
-                ))
-            } else {
-                None
+    /// Returns a score 0.0–2.5 representing RSI exhaustion level, and updates prev_rsi.
+    ///
+    /// - 0.0  = RSI 30–70 (neutral)
+    /// - 0.5  = RSI 20–30 or 70–80 (warming up)
+    /// - 1.0  = RSI 10–20 or 80–90 (extended)
+    /// - 2.0  = RSI < 10 or > 90 (extreme)
+    /// - 2.5  = RSI hook from extreme (was > 90 turning down, or was < 10 turning up)
+    fn score_rsi_exhaustion(&mut self) -> f64 {
+        let current = match self.rsi(2) {
+            Some(r) => r,
+            None => {
+                self.prev_rsi = None;
+                return 0.0;
             }
-        } else {
-            None
         };
-        self.prev_rsi = Some(current_rsi);
-        result
+        let score = if let Some(prev) = self.prev_rsi {
+            if (prev > 90.0 && current < prev) || (prev < 10.0 && current > prev) {
+                2.5 // hook from extreme
+            } else if !(10.0..=90.0).contains(&current) {
+                2.0
+            } else if !(20.0..=80.0).contains(&current) {
+                1.0
+            } else if !(30.0..=70.0).contains(&current) {
+                0.5
+            } else {
+                0.0
+            }
+        } else if !(10.0..=90.0).contains(&current) {
+            2.0
+        } else if !(20.0..=80.0).contains(&current) {
+            1.0
+        } else if !(30.0..=70.0).contains(&current) {
+            0.5
+        } else {
+            0.0
+        };
+        self.prev_rsi = Some(current);
+        score
     }
 }
 
@@ -221,20 +259,34 @@ impl DeltaState {
         self.window_open_price = close_price;
     }
 
-    /// Returns the net delta accumulated in the current (not-yet-finalised) window.
-    fn current_delta(&self) -> f64 {
-        self.window_delta
-    }
-
-    /// Returns true if the most recently completed window shows divergence
-    /// (price direction opposite to delta direction).
-    fn check_divergence(&self) -> bool {
+    /// Returns a score 0.0–3.0 for order-flow delta divergence.
+    ///
+    /// - 0.0 = No divergence (price and delta in the same direction)
+    /// - 1.5 = Mild divergence (price moving one way, delta flat or weakly opposite)
+    /// - 3.0 = Strong divergence (price moving one way, delta strongly the other)
+    fn score_delta_divergence(&self) -> f64 {
         let Some(&(delta, open, close)) = self.completed_windows.back() else {
-            return false;
+            return 0.0;
         };
-        let price_up = close > open;
-        let price_down = close < open;
-        (price_up && delta < 0.0) || (price_down && delta > 0.0)
+        let price_change = close - open;
+        if price_change == 0.0 || delta == 0.0 {
+            return 0.0;
+        }
+        let price_up = price_change > 0.0;
+        let delta_up = delta > 0.0;
+        if price_up == delta_up {
+            return 0.0; // same direction — no divergence
+        }
+        // Divergence confirmed.  Classify as strong if both the price move and
+        // the opposing delta are significant: price moved at least 0.01% (1 bp)
+        // and delta reached at least 0.5 BTC in the opposite direction.
+        let price_pct = (price_change / open).abs();
+        let delta_abs = delta.abs();
+        if price_pct >= 0.0001 && delta_abs >= 0.5 {
+            3.0
+        } else {
+            1.5
+        }
     }
 }
 
@@ -277,6 +329,29 @@ impl BollingerState {
         let lower = mean - 2.0 * sd;
         Some((upper - lower) / mean)
     }
+
+    /// Returns a score 0.0–1.5 for Bollinger Band squeeze (based on band width %).
+    ///
+    /// - 0.0  = band width > 0.10% (normal volatility)
+    /// - 0.5  = band width 0.05–0.10% (narrowing)
+    /// - 0.75 = band width 0.03–0.05% (tight squeeze)
+    /// - 1.5  = band width < 0.03% (extreme squeeze)
+    fn score_bollinger_squeeze(&self) -> f64 {
+        match self.band_width() {
+            None => 0.0,
+            Some(w) => {
+                if w < 0.0003 {
+                    1.5 // < 0.03%
+                } else if w < 0.0005 {
+                    0.75 // 0.03–0.05%
+                } else if w < 0.001 {
+                    0.5 // 0.05–0.10%
+                } else {
+                    0.0 // > 0.10%
+                }
+            }
+        }
+    }
 }
 
 // ── Sell Wall Detection ────────────────────────────────────────────────────
@@ -290,14 +365,12 @@ fn price_to_cents(price: f64) -> u64 {
 struct SellWallState {
     /// Ask-side order book: price in cents (price * 100 rounded) → size in BTC.
     asks: BTreeMap<u64, f64>,
-    last_signal: Option<String>,
 }
 
 impl SellWallState {
     fn new() -> Self {
         Self {
             asks: BTreeMap::new(),
-            last_signal: None,
         }
     }
 
@@ -332,36 +405,43 @@ impl SellWallState {
         }
     }
 
-    /// Scan the current ask book and update `last_signal`.
-    fn update_signal(&mut self, current_price: f64) {
+    /// Returns a score 0.0–1.0 for sell-wall proximity.
+    ///
+    /// - 0.0 = No significant wall nearby
+    /// - 0.3 = Wall > 5 BTC within 0.2% of current price
+    /// - 0.5 = Wall > 10 BTC within 0.1% of current price
+    /// - 1.0 = Massive wall > 20 BTC within 0.05% of current price
+    fn score_wall_proximity(&self, current_price: f64) -> f64 {
         if current_price == 0.0 {
-            self.last_signal = None;
-            return;
+            return 0.0;
         }
-        let threshold = current_price * 1.001; // 0.1% above current price
         let min_key = price_to_cents(current_price);
-        let max_key = price_to_cents(threshold);
-        // A "sell wall" is a large ask order that sits just above the current
-        // price and acts as a ceiling.  We require: (a) within 0.1% of price
-        // so it is immediately relevant, and (b) ≥ 10 BTC so it is large
-        // enough to meaningfully absorb market buys.
-        for (&price_cents, &size) in self.asks.range(min_key..=max_key) {
-            if size >= 10.0 {
-                let ask_price = price_cents as f64 * 0.01;
-                self.last_signal = Some(format!(
-                    "🧱 SELL WALL: {:.3} BTC ask at ${:.2} ({:.3}% above price) — 95% YES is a trap!",
-                    size,
-                    ask_price,
-                    (ask_price - current_price) / current_price * 100.0,
-                ));
-                return;
+
+        // Tier 1: massive wall (> 20 BTC) within 0.05%
+        let max_key_005 = price_to_cents(current_price * 1.0005);
+        for (&_, &size) in self.asks.range(min_key..=max_key_005) {
+            if size > 20.0 {
+                return 1.0;
             }
         }
-        self.last_signal = None;
-    }
 
-    fn check_signal(&self) -> Option<&str> {
-        self.last_signal.as_deref()
+        // Tier 2: large wall (> 10 BTC) within 0.1%
+        let max_key_01 = price_to_cents(current_price * 1.001);
+        for (&_, &size) in self.asks.range(min_key..=max_key_01) {
+            if size > 10.0 {
+                return 0.5;
+            }
+        }
+
+        // Tier 3: significant wall (> 5 BTC) within 0.2%
+        let max_key_02 = price_to_cents(current_price * 1.002);
+        for (&_, &size) in self.asks.range(min_key..=max_key_02) {
+            if size > 5.0 {
+                return 0.3;
+            }
+        }
+
+        0.0
     }
 }
 
@@ -395,10 +475,21 @@ fn format_usd_change(value: f64) -> String {
 
 // ── Timing helpers ─────────────────────────────────────────────────────────
 
-/// Returns how many seconds we are into the current 1-minute block (0–59).
-fn seconds_into_block() -> u64 {
-    let now = Utc::now();
-    now.timestamp() as u64 % 60
+// ── RRI helpers ────────────────────────────────────────────────────────────
+
+/// Maps an RRI score to (emoji, label, short meaning).
+fn rri_label(rri: f64) -> (&'static str, &'static str, &'static str) {
+    if rri >= 8.1 {
+        ("🚨", "EXTREME", "DO NOT ENTER!")
+    } else if rri >= 6.6 {
+        ("🔴", "HIGH RISK", "Avoid new entries")
+    } else if rri >= 4.6 {
+        ("🟠", "ELEVATED", "Reversal pressure building")
+    } else if rri >= 2.6 {
+        ("🟡", "MODERATE", "Caution, some signals warming")
+    } else {
+        ("🟢", "LOW RISK", "Safe to trade")
+    }
 }
 
 // ── Application state ──────────────────────────────────────────────────────
@@ -485,7 +576,7 @@ impl AppState {
 
         // Evict trades older than 60 seconds from the rolling buffer.
         let cutoff_ms = now_ms.saturating_sub(60_000);
-        while self.rolling_trades.front().map_or(false, |t| t.timestamp_ms < cutoff_ms) {
+        while self.rolling_trades.front().is_some_and(|t| t.timestamp_ms < cutoff_ms) {
             self.rolling_trades.pop_front();
         }
 
@@ -526,78 +617,35 @@ impl AppState {
         if self.tick_count % 3 == 0 {
             let price = self.current_price;
 
-            // Get current window delta before finalising.
-            let delta_val = self.delta.current_delta();
-            // Finalise the 15-second delta window.
+            // Finalise the 15-second delta window before scoring.
             self.delta.finalize_window(price);
-            // Evaluate sell wall at the 15-second checkpoint.
-            self.sell_wall.update_signal(price);
 
-            // Collect signal values.
-            let rsi_val = self.rsi.rsi(2);
-            let rsi_signal = self.rsi.check_signal();
-            let divergence = self.delta.check_divergence();
-            let bb_width = self.bollinger.band_width();
-            let bb_squeeze = bb_width.map_or(false, |w| w < 0.0005);
-            let vwap_z = self.vwap.z_score(price);
-            let vwap_warn = vwap_z.abs() > 1.5;
-            let sell_wall_sig = self.sell_wall.check_signal().map(|s| s.to_string());
+            // Calculate the composite Reversal Risk Index.
+            let (rri, delta_score, rsi_score, vwap_score, bb_score, wall_score) =
+                self.calculate_rri(price);
 
-            // Count active warnings.
-            let mut warn_count = 0usize;
-            if rsi_signal.is_some() { warn_count += 1; }
-            if divergence { warn_count += 1; }
-            if bb_squeeze { warn_count += 1; }
-            if vwap_warn { warn_count += 1; }
-            if sell_wall_sig.is_some() { warn_count += 1; }
-
-            // Danger zone: last 15 seconds of the minute (:45 checkpoint).
-            let is_danger = seconds_into_block() >= 45;
-
-            let signal_line = if is_danger && warn_count >= 2 {
-                let mut parts: Vec<String> = Vec::new();
-                if let Some(s) = rsi_signal {
-                    parts.push(s);
-                }
-                let sign = if delta_val >= 0.0 { "+" } else { "" };
-                parts.push(format!("Delta: {sign}{:.2}", delta_val));
-                if vwap_warn {
-                    parts.push(format!("VWAP Z: {:.1}", vwap_z));
-                }
-                if let Some(sw) = sell_wall_sig {
-                    parts.push(sw);
-                }
-                format!(
-                    "   🚨 [DANGER ZONE] {} — {warn_count}/5 DO NOT ENTER!",
-                    parts.join(" | ")
-                )
-            } else {
-                let rsi_str = rsi_val.map_or("N/A".to_string(), |r| format!("{:.1}", r));
-                let sign = if delta_val >= 0.0 { "+" } else { "" };
-                let div_tag = if divergence { " (DIVERGENCE)" } else { "" };
-                let bb_str = bb_width.map_or("N/A".to_string(), |w| {
-                    let sq_tag = if bb_squeeze { " (SQUEEZE)" } else { "" };
-                    format!("{:.2}%{sq_tag}", w * 100.0)
-                });
-                let content = format!(
-                    "RSI: {rsi_str} | Delta: {sign}{:.2}{div_tag} | BB Width: {bb_str} | VWAP Z: {:.1}",
-                    delta_val, vwap_z
-                );
-                if warn_count == 0 {
-                    format!("   📈 [SIGNAL CHECK] {content} — ✅ No warnings")
-                } else {
-                    let sw_part = sell_wall_sig
-                        .as_deref()
-                        .map_or(String::new(), |s| format!(" | {s}"));
-                    let plural = if warn_count == 1 { "" } else { "s" };
-                    format!("   ⚠️ [SIGNAL CHECK] {content}{sw_part} — {warn_count} warning{plural}")
-                }
-            };
+            let (emoji, label, meaning) = rri_label(rri);
+            let signal_line = format!(
+                "   {emoji} RRI: {rri:.1}/10 — {label} — {meaning}\n   [Delta: {delta_score:.1} | RSI: {rsi_score:.1} | VWAP: {vwap_score:.1} | BB: {bb_score:.2} | Wall: {wall_score:.1}]"
+            );
 
             output.push(signal_line);
         }
 
         output
+    }
+
+    /// Calculate the Reversal Risk Index from all 5 component scores.
+    /// Returns (total_rri, delta_score, rsi_score, vwap_score, bb_score, wall_score).
+    fn calculate_rri(&mut self, price: f64) -> (f64, f64, f64, f64, f64, f64) {
+        let delta_score = self.delta.score_delta_divergence();
+        let rsi_score = self.rsi.score_rsi_exhaustion();
+        let vwap_score = self.vwap.score_vwap_deviation(price);
+        let bb_score = self.bollinger.score_bollinger_squeeze();
+        let wall_score = self.sell_wall.score_wall_proximity(price);
+        let total = (delta_score + rsi_score + vwap_score + bb_score + wall_score)
+            .clamp(1.0, 10.0);
+        (total, delta_score, rsi_score, vwap_score, bb_score, wall_score)
     }
 }
 
