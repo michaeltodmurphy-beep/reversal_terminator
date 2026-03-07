@@ -502,8 +502,8 @@ async fn main() {
     println!("🚀 Reversal Terminator — BTC/USD 1-min chart monitor starting…");
     println!("   Connecting to Binance WebSocket streams…\n");
 
-    let trade_url = "wss://stream.binance.com:9443/ws/btcusdt@aggTrade";
-    let depth_url = "wss://stream.binance.com:9443/ws/btcusdt@depth20@100ms";
+    let trade_url = "wss://stream.binance.us:9443/ws/btcusdt@aggTrade";
+    let depth_url = "wss://stream.binance.us:9443/ws/btcusdt@depth20@100ms";
 
     let trade_ws = connect_ws(trade_url).await;
     let depth_ws = connect_ws(depth_url).await;

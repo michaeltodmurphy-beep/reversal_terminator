@@ -75,8 +75,8 @@ During the danger zone:
 🚀 Reversal Terminator — BTC/USD 1-min chart monitor starting…
    Connecting to Binance WebSocket streams…
 
-✅ Connected to wss://stream.binance.com:9443/ws/btcusdt@aggTrade
-✅ Connected to wss://stream.binance.com:9443/ws/btcusdt@depth20@100ms
+✅ Connected to wss://stream.binance.us:9443/ws/btcusdt@aggTrade
+✅ Connected to wss://stream.binance.us:9443/ws/btcusdt@depth20@100ms
 📡 Streaming live data — watching for reversals…
 
 📊 BTC: $96423.10 | VWAP: $96418.55 | Delta: 1.243 | Sec: 12/60
@@ -120,10 +120,10 @@ cargo build --release
 cargo run --release
 ```
 
-> **Note for US users**: Binance.com may be geo-restricted in the United States. If you see connection errors, replace the stream URLs in `src/main.rs` with the US endpoints:
+> **Note**: This application connects to **Binance.US** (`stream.binance.us`) by default, which works from US-based servers. Non-US users can switch back to the global endpoints by replacing the stream URLs in `src/main.rs`:
 > ```
-> wss://stream.binance.us:9443/ws/btcusdt@aggTrade
-> wss://stream.binance.us:9443/ws/btcusdt@depth20@100ms
+> wss://stream.binance.com:9443/ws/btcusdt@aggTrade
+> wss://stream.binance.com:9443/ws/btcusdt@depth20@100ms
 > ```
 
 ---
