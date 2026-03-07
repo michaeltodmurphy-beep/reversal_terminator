@@ -477,6 +477,9 @@ fn format_usd_change(value: f64) -> String {
 
 // ── RRI helpers ────────────────────────────────────────────────────────────
 
+/// EMA smoothing factor for the RRI (~4 readings / ~1 minute window).
+const RRI_ALPHA: f64 = 0.3;
+
 /// Maps an RRI score to (emoji, label, short meaning).
 fn rri_label(rri: f64) -> (&'static str, &'static str, &'static str) {
     if rri >= 8.1 {
@@ -511,6 +514,12 @@ struct AppState {
     rolling_60s_avg: f64,
     /// Price at the previous 5-second tick, for Δ5s calculation.
     prev_5s_price: f64,
+    /// EMA-smoothed RRI value displayed to the user.
+    smoothed_rri: f64,
+    /// Previous smoothed RRI value, used to compute the trend arrow.
+    previous_smoothed_rri: f64,
+    /// False until the first RRI reading has been processed.
+    rri_initialized: bool,
 }
 
 impl AppState {
@@ -528,6 +537,9 @@ impl AppState {
             rolling_trades: VecDeque::new(),
             rolling_60s_avg: 0.0,
             prev_5s_price: 0.0,
+            smoothed_rri: 0.0,
+            previous_smoothed_rri: 0.0,
+            rri_initialized: false,
         }
     }
 
@@ -621,12 +633,38 @@ impl AppState {
             self.delta.finalize_window(price);
 
             // Calculate the composite Reversal Risk Index.
-            let (rri, delta_score, rsi_score, vwap_score, bb_score, wall_score) =
+            let (raw_rri, delta_score, rsi_score, vwap_score, bb_score, wall_score) =
                 self.calculate_rri(price);
 
-            let (emoji, label, meaning) = rri_label(rri);
+            // Apply EMA smoothing to the raw RRI.
+            let is_first_reading = !self.rri_initialized;
+            if is_first_reading {
+                self.smoothed_rri = raw_rri;
+                self.rri_initialized = true;
+            } else {
+                self.previous_smoothed_rri = self.smoothed_rri;
+                self.smoothed_rri =
+                    (RRI_ALPHA * raw_rri) + ((1.0 - RRI_ALPHA) * self.smoothed_rri);
+            }
+
+            // Derive trend arrow from change in smoothed RRI.
+            let trend_arrow = if is_first_reading {
+                "→" // first reading — no prior value to compare
+            } else {
+                let diff = self.smoothed_rri - self.previous_smoothed_rri;
+                if diff > 0.3 {
+                    "↑" // risk increasing
+                } else if diff < -0.3 {
+                    "↓" // risk decreasing
+                } else {
+                    "→" // stable
+                }
+            };
+
+            let smoothed = self.smoothed_rri;
+            let (emoji, label, meaning) = rri_label(smoothed);
             let signal_line = format!(
-                "   {emoji} RRI: {rri:.1}/10 — {label} — {meaning}\n   [Delta: {delta_score:.1} | RSI: {rsi_score:.1} | VWAP: {vwap_score:.1} | BB: {bb_score:.2} | Wall: {wall_score:.1}]"
+                "   {emoji} RRI: {smoothed:.1}/10 {trend_arrow} — {label} — {meaning}\n   [Delta: {delta_score:.1} | RSI: {rsi_score:.1} | VWAP: {vwap_score:.1} | BB: {bb_score:.2} | Wall: {wall_score:.1}]"
             );
 
             output.push(signal_line);

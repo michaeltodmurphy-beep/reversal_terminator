@@ -19,11 +19,32 @@ Every **5 seconds** the current price, 60-second rolling volume-weighted average
 
 ## Reversal Risk Index (RRI)
 
-Each indicator contributes a weighted sub-score. The RRI is their sum, floored at 1.0 and capped at 10.0.
+Each indicator contributes a weighted sub-score. The raw RRI is their sum, floored at 1.0 and capped at 10.0. To eliminate erratic jumps, the displayed RRI is smoothed with an **Exponential Moving Average (EMA)** before it is shown.
 
 ```rust
-let rri = (delta_score + rsi_score + vwap_score + bb_score + wall_score).clamp(1.0, 10.0);
+let raw_rri = (delta_score + rsi_score + vwap_score + bb_score + wall_score).clamp(1.0, 10.0);
+// EMA smoothing (α = 0.3, ~1 minute window):
+smoothed_rri = 0.3 * raw_rri + 0.7 * smoothed_rri;
 ```
+
+### EMA Smoothing
+
+| Parameter | Value | Effect |
+|-----------|-------|--------|
+| Alpha (α) | 0.3 | ~4 readings / ~1 minute smoothing window |
+| First reading | Initialised to raw RRI | No lag on start-up |
+
+The smoothed value is used for both the displayed score and the risk level label/emoji. The raw component scores in the bracket line are always the **unsmoothed** values so you can see exactly what is driving the RRI.
+
+### Trend Arrow
+
+A directional arrow is printed after the score to show whether risk is rising or falling:
+
+| Arrow | Meaning | Condition |
+|-------|---------|-----------|
+| `↑` | Risk increasing | Smoothed RRI rose by > 0.3 since last reading |
+| `↓` | Risk decreasing | Smoothed RRI fell by > 0.3 since last reading |
+| `→` | Stable | Change ≤ 0.3, or first reading |
 
 ### Component Weights
 
@@ -123,25 +144,25 @@ Scans the ask side of the live order book for large limit orders close to the cu
 💰 [19:31:05] BTC: $67,245.56 | 60s Avg: $67,241.20 | Δ5s: +$2.30
 💰 [19:31:10] BTC: $67,250.10 | 60s Avg: $67,243.50 | Δ5s: +$4.54
 💰 [19:31:15] BTC: $67,248.80 | 60s Avg: $67,244.10 | Δ5s: -$1.30
-   🟢 RRI: 1.8/10 — LOW RISK — Safe to trade
+   🟢 RRI: 1.8/10 → — LOW RISK — Safe to trade
    [Delta: 0.0 | RSI: 0.5 | VWAP: 0.8 | BB: 0.50 | Wall: 0.0]
 
 💰 [19:31:20] BTC: $67,252.00 | 60s Avg: $67,245.60 | Δ5s: +$3.20
 💰 [19:31:25] BTC: $67,255.30 | 60s Avg: $67,247.80 | Δ5s: +$3.30
 💰 [19:31:30] BTC: $67,253.10 | 60s Avg: $67,248.90 | Δ5s: -$2.20
-   🟡 RRI: 3.2/10 — MODERATE — Caution, some signals warming
+   🟡 RRI: 2.8/10 ↑ — MODERATE — Caution, some signals warming
    [Delta: 0.8 | RSI: 1.0 | VWAP: 1.0 | BB: 0.40 | Wall: 0.0]
 
 💰 [19:31:35] BTC: $67,249.50 | 60s Avg: $67,249.10 | Δ5s: -$3.60
 💰 [19:31:40] BTC: $67,247.20 | 60s Avg: $67,249.00 | Δ5s: -$2.30
 💰 [19:31:45] BTC: $67,244.80 | 60s Avg: $67,248.50 | Δ5s: -$2.40
-   🟠 RRI: 5.8/10 — ELEVATED — Reversal pressure building
+   🟠 RRI: 4.7/10 ↑ — ELEVATED — Reversal pressure building
    [Delta: 2.1 | RSI: 1.5 | VWAP: 1.2 | BB: 0.50 | Wall: 0.5]
 
 💰 [19:31:50] BTC: $67,242.10 | 60s Avg: $67,247.80 | Δ5s: -$2.70
 💰 [19:31:55] BTC: $67,240.50 | 60s Avg: $67,247.00 | Δ5s: -$1.60
 💰 [19:32:00] BTC: $67,241.80 | 60s Avg: $67,246.50 | Δ5s: +$1.30
-   🟢 RRI: 1.3/10 — LOW RISK — Safe to trade
+   🟡 RRI: 3.6/10 ↓ — MODERATE — Caution, some signals warming
    [Delta: 0.0 | RSI: 0.0 | VWAP: 0.3 | BB: 0.00 | Wall: 0.0]
 ```
 
