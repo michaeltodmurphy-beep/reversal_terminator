@@ -1,28 +1,48 @@
 use chrono::Utc;
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use std::collections::VecDeque;
-use tokio_tungstenite::connect_async;
+use std::collections::{BTreeMap, VecDeque};
+use std::time::Duration;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 use url::Url;
 
-// ── Binance message types ──────────────────────────────────────────────────
+// ── Coinbase message types ──────────────────────────────────────────────────
 
+/// Parsed subset of messages from the Coinbase Exchange WebSocket feed.
 #[derive(Deserialize, Debug)]
-struct AggTrade {
-    #[serde(rename = "p")]
-    price: String,
-    #[serde(rename = "q")]
-    qty: String,
-    /// true  → buyer is the market maker → this is a SELL order
-    /// false → buyer is the taker        → this is a BUY order
-    #[serde(rename = "m")]
-    is_buyer_maker: bool,
+#[serde(tag = "type")]
+enum CoinbaseMessage {
+    /// Real-time trade from the `matches` channel.
+    #[serde(rename = "match")]
+    Match {
+        price: String,
+        size: String,
+        /// "buy"  → taker was a buyer  → positive delta
+        /// "sell" → taker was a seller → negative delta
+        side: String,
+    },
+    /// Initial order-book snapshot from the `level2_batch` channel.
+    #[serde(rename = "snapshot")]
+    Snapshot {
+        asks: Vec<[String; 2]>,
+    },
+    /// Incremental order-book update from the `level2_batch` channel.
+    #[serde(rename = "l2update")]
+    L2Update {
+        /// Each element is `[side, price, size]`; size "0" means remove the level.
+        changes: Vec<[String; 3]>,
+    },
+    /// Any other message type (subscriptions confirmation, heartbeats, …).
+    #[serde(other)]
+    Other,
 }
 
-#[derive(Deserialize, Debug)]
-struct DepthUpdate {
-    #[serde(rename = "asks")]
-    asks: Vec<[String; 2]>,
+// ── Rolling trade record ───────────────────────────────────────────────────
+
+struct TimedTrade {
+    price: f64,
+    volume: f64,
+    timestamp_ms: u64,
 }
 
 // ── Indicator state ────────────────────────────────────────────────────────
@@ -183,10 +203,10 @@ impl DeltaState {
         }
     }
 
-    fn update(&mut self, price: f64, qty: f64, is_buyer_maker: bool) {
-        // is_buyer_maker == true  → market SELL (negative delta)
-        // is_buyer_maker == false → market BUY  (positive delta)
-        if is_buyer_maker {
+    fn update(&mut self, price: f64, qty: f64, is_sell: bool) {
+        // is_sell == true  → market SELL (negative delta)
+        // is_sell == false → market BUY  (positive delta)
+        if is_sell {
             self.cumulative_delta -= qty;
         } else {
             self.cumulative_delta += qty;
@@ -287,35 +307,82 @@ impl BollingerState {
 
 // ── Sell Wall Detection ────────────────────────────────────────────────────
 
+/// Converts a USD price to an integer cent key for use in the ask BTreeMap.
+#[inline]
+fn price_to_cents(price: f64) -> u64 {
+    (price * 100.0).round() as u64
+}
+
 struct SellWallState {
+    /// Ask-side order book: price in cents (price * 100 rounded) → size in BTC.
+    asks: BTreeMap<u64, f64>,
     last_signal: Option<String>,
 }
 
 impl SellWallState {
     fn new() -> Self {
-        Self { last_signal: None }
+        Self {
+            asks: BTreeMap::new(),
+            last_signal: None,
+        }
     }
 
-    fn update(&mut self, asks: &[[String; 2]], current_price: f64) {
+    /// Replace the entire ask book from a Coinbase `snapshot` message.
+    fn apply_snapshot(&mut self, asks: &[[String; 2]]) {
+        self.asks.clear();
+        for level in asks {
+            let price: f64 = level[0].parse().unwrap_or(0.0);
+            let size: f64 = level[1].parse().unwrap_or(0.0);
+            if price > 0.0 && size > 0.0 {
+                self.asks.insert(price_to_cents(price), size);
+            }
+        }
+    }
+
+    /// Apply incremental changes from a Coinbase `l2update` message.
+    /// Each change is `[side, price, size]`; size "0" removes the level.
+    fn apply_changes(&mut self, changes: &[[String; 3]]) {
+        for change in changes {
+            if change[0] == "sell" {
+                let price: f64 = change[1].parse().unwrap_or(0.0);
+                let size: f64 = change[2].parse().unwrap_or(0.0);
+                if price > 0.0 {
+                    let key = price_to_cents(price);
+                    if size == 0.0 {
+                        self.asks.remove(&key);
+                    } else {
+                        self.asks.insert(key, size);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Scan the current ask book and update `last_signal`.
+    fn update_signal(&mut self, current_price: f64) {
+        if current_price == 0.0 {
+            self.last_signal = None;
+            return;
+        }
         let threshold = current_price * 1.001; // 0.1% above current price
+        let min_key = price_to_cents(current_price);
+        let max_key = price_to_cents(threshold);
         // A "sell wall" is a large ask order that sits just above the current
         // price and acts as a ceiling.  We require: (a) within 0.1% of price
         // so it is immediately relevant, and (b) ≥ 10 BTC so it is large
         // enough to meaningfully absorb market buys.
-        for level in asks {
-            let ask_price: f64 = level[0].parse().unwrap_or(0.0);
-            let ask_qty: f64 = level[1].parse().unwrap_or(0.0);
-            if ask_price > 0.0 && ask_price <= threshold && ask_qty >= 10.0 {
+        for (&price_cents, &size) in self.asks.range(min_key..=max_key) {
+            if size >= 10.0 {
+                let ask_price = price_cents as f64 * 0.01;
                 self.last_signal = Some(format!(
                     "🧱 SELL WALL: {:.3} BTC ask at ${:.2} ({:.3}% above price) — 95% YES is a trap!",
-                    ask_qty,
+                    size,
                     ask_price,
                     (ask_price - current_price) / current_price * 100.0,
                 ));
                 return;
             }
         }
-        // no wall found
         self.last_signal = None;
     }
 
@@ -376,10 +443,14 @@ struct AppState {
     current_price: f64,
     current_minute: u32,
     trade_count: u64,
-    // per-block trade counter used for status prints
+    /// Per-block trade counter used for danger-zone cadence.
     block_trade_count: u64,
-    // closing price of the previous 1-minute block (for change calculation)
-    prev_block_close_price: f64,
+    /// Rolling 60-second trade buffer for volume-weighted average.
+    rolling_trades: VecDeque<TimedTrade>,
+    /// Most recently calculated 60-second rolling average (kept for "Stale" display).
+    rolling_60s_avg: f64,
+    /// Price at the previous 5-second tick, for Δ5s calculation.
+    prev_5s_price: f64,
 }
 
 impl AppState {
@@ -395,7 +466,9 @@ impl AppState {
             current_minute: 0,
             trade_count: 0,
             block_trade_count: 0,
-            prev_block_close_price: 0.0,
+            rolling_trades: VecDeque::new(),
+            rolling_60s_avg: 0.0,
+            prev_5s_price: 0.0,
         }
     }
 
@@ -411,9 +484,10 @@ impl AppState {
         }
     }
 
-    fn handle_trade(&mut self, msg: AggTrade) {
-        let price: f64 = msg.price.parse().unwrap_or(0.0);
-        let qty: f64 = msg.qty.parse().unwrap_or(0.0);
+    /// Process a `match` message from the Coinbase `matches` channel.
+    fn handle_match(&mut self, price_str: &str, size_str: &str, side: &str) {
+        let price: f64 = price_str.parse().unwrap_or(0.0);
+        let qty: f64 = size_str.parse().unwrap_or(0.0);
         if price == 0.0 || qty == 0.0 {
             return;
         }
@@ -423,40 +497,31 @@ impl AppState {
         self.trade_count += 1;
         self.block_trade_count += 1;
 
-        // update indicators
+        // Record trade in the rolling buffer.
+        let now_ms = Utc::now().timestamp_millis() as u64;
+        self.rolling_trades.push_back(TimedTrade { price, volume: qty, timestamp_ms: now_ms });
+
+        // Update per-minute indicators.
         self.vwap.update(price, qty);
         self.rsi.update(price);
-        self.delta.update(price, qty, msg.is_buyer_maker);
+        // Coinbase: side "sell" → taker was a seller → negative delta
+        self.delta.update(price, qty, side == "sell");
         self.bollinger.update(price);
 
-        // periodic RSI hook check
+        // Periodic RSI hook check.
         let rsi_signal = self.rsi.check_signal();
 
-        // print status every ~200 trades
-        if self.block_trade_count.is_multiple_of(200) {
-            let sec = seconds_into_block();
-            let vwap_price = self.vwap.vwap();
-            let delta = self.delta.cumulative_delta;
-            println!(
-                "📊 BTC: ${:.2} | VWAP: ${:.2} | Delta: {:.3} | Sec: {}/60",
-                price, vwap_price, delta, sec
-            );
-        }
-
-        // danger zone logic
+        // Danger zone logic.
         if is_danger_zone() {
             let sec = seconds_into_block();
             let remaining = 60u64.saturating_sub(sec);
 
-            // print danger zone header once per 10-trade cadence in the zone
-            if self.block_trade_count.is_multiple_of(10) {
-                println!(
-                    "🔴 DANGER ZONE — Second {}/60 — Last {} seconds!",
-                    sec, remaining
-                );
+            // Print danger zone header once per 10-trade cadence in the zone.
+            if self.block_trade_count % 10 == 0 {
+                println!("🔴 DANGER ZONE — Second {}/60 — Last {} seconds!", sec, remaining);
             }
 
-            // gather signals
+            // Gather all active signals.
             let mut signals: Vec<String> = Vec::new();
 
             if let Some(s) = self.vwap.check_signal(price) {
@@ -486,37 +551,103 @@ impl AppState {
                 );
             }
         } else if let Some(s) = rsi_signal {
-            // still print RSI hooks outside danger zone
+            // Still print RSI hooks outside the danger zone.
             println!("{s}");
         }
     }
 
-    fn handle_depth(&mut self, msg: DepthUpdate) {
+    /// Called on every 5-second tick. Evicts stale rolling trades, recalculates
+    /// the 60-second average, and returns the formatted status line.
+    fn on_tick(&mut self) -> Option<String> {
         if self.current_price == 0.0 {
-            return;
+            return None;
         }
-        self.sell_wall.update(&msg.asks, self.current_price);
+
+        let now = Utc::now();
+        let ts = now.format("%H:%M:%S");
+        let now_ms = now.timestamp_millis() as u64;
+
+        // Evict trades older than 60 seconds from the rolling buffer.
+        let cutoff_ms = now_ms.saturating_sub(60_000);
+        while let Some(front) = self.rolling_trades.front() {
+            if front.timestamp_ms < cutoff_ms {
+                self.rolling_trades.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        // Calculate the 60-second volume-weighted average.
+        let avg_str = if self.rolling_trades.is_empty() {
+            // No trades in the last 60 s — show last known value with a warning.
+            if self.rolling_60s_avg > 0.0 {
+                format!("{} ⚠️ Stale", format_usd(self.rolling_60s_avg))
+            } else {
+                "N/A".to_string()
+            }
+        } else {
+            let (total_pv, total_vol) = self.rolling_trades.iter().fold(
+                (0.0f64, 0.0f64),
+                |(pv, v), t| (pv + t.price * t.volume, v + t.volume),
+            );
+            if total_vol > 0.0 {
+                self.rolling_60s_avg = total_pv / total_vol;
+            }
+            format_usd(self.rolling_60s_avg)
+        };
+
+        let vwap = self.vwap.vwap();
+        let vwap_str = if vwap > 0.0 {
+            format!(" | VWAP: {}", format_usd(vwap))
+        } else {
+            String::new()
+        };
+
+        let delta_str = if self.prev_5s_price > 0.0 {
+            let delta_5s = self.current_price - self.prev_5s_price;
+            format!(" | Δ5s: {}", format_usd_change(delta_5s))
+        } else {
+            String::new()
+        };
+
+        self.prev_5s_price = self.current_price;
+
+        Some(format!(
+            "💰 [{ts}] BTC Price: {} | 60s Avg: {avg_str}{vwap_str}{delta_str}",
+            format_usd(self.current_price)
+        ))
     }
 }
 
 // ── WebSocket task helpers ─────────────────────────────────────────────────
 
-/// Connect (with simple retry) and return the WebSocket stream.
-async fn connect_ws(
-    url_str: &str,
-) -> tokio_tungstenite::WebSocketStream<
+const COINBASE_URL: &str = "wss://ws-feed.exchange.coinbase.com";
+
+/// Subscribe message sent to Coinbase immediately after connecting.
+const SUBSCRIBE_MSG: &str =
+    r#"{"type":"subscribe","product_ids":["BTC-USD"],"channels":["matches","level2_batch"]}"#;
+
+/// Connect to the Coinbase Exchange WebSocket and send the subscribe message.
+/// Retries indefinitely on failure.
+async fn connect_ws_coinbase() -> tokio_tungstenite::WebSocketStream<
     tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
 > {
-    let url = Url::parse(url_str).expect("invalid URL");
+    let url = Url::parse(COINBASE_URL).expect("invalid URL");
     loop {
         match connect_async(url.clone()).await {
-            Ok((ws, _)) => {
-                println!("✅ Connected to {url_str}");
-                return ws;
+            Ok((mut ws, _)) => {
+                println!("✅ Connected to {COINBASE_URL}");
+                match ws.send(Message::Text(SUBSCRIBE_MSG.to_string())).await {
+                    Ok(_) => return ws,
+                    Err(e) => {
+                        eprintln!("⚠️  Subscribe failed ({e}), retrying in 3s …");
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                    }
+                }
             }
             Err(e) => {
                 eprintln!("⚠️  Connection failed ({e}), retrying in 3s …");
-                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                tokio::time::sleep(Duration::from_secs(3)).await;
             }
         }
     }
@@ -526,100 +657,52 @@ async fn connect_ws(
 
 #[tokio::main]
 async fn main() {
-    println!("🚀 Reversal Terminator — BTC/USD 1-min chart monitor starting…");
-    println!("   Connecting to Binance WebSocket streams…\n");
+    println!("🚀 Reversal Terminator — BTC/USD monitor starting…");
+    println!("   Connecting to Coinbase Exchange WebSocket…\n");
 
-    let trade_url = "wss://stream.binance.us:9443/ws/btcusdt@aggTrade";
-    let depth_url = "wss://stream.binance.us:9443/ws/btcusdt@depth20@100ms";
-
-    let trade_ws = connect_ws(trade_url).await;
-    let depth_ws = connect_ws(depth_url).await;
-
-    let mut trade_stream = trade_ws.fuse();
-    let mut depth_stream = depth_ws.fuse();
+    let ws = connect_ws_coinbase().await;
+    let mut stream = ws.fuse();
 
     let mut state = AppState::new();
-
-    // ── Clock-driven 1-minute timer ──────────────────────────────────────────
-    // Sleep until the next :00 second boundary so the interval fires at
-    // exactly XX:XX:00 on every subsequent tick.
-    let now = Utc::now();
-    let secs_until_next_min = 60 - (now.timestamp().rem_euclid(60) as u64);
-    tokio::time::sleep(tokio::time::Duration::from_secs(secs_until_next_min)).await;
-    // `interval` fires immediately on the first `tick()` call, which happens
-    // right at the minute boundary we just slept to, then every 60 s after.
-    let mut minute_timer = tokio::time::interval(tokio::time::Duration::from_secs(60));
+    // 5-second tick drives the status line; no initial alignment sleep needed.
+    let mut ticker = tokio::time::interval(Duration::from_secs(5));
 
     println!("📡 Streaming live data — watching for reversals…\n");
 
     loop {
         tokio::select! {
-            msg = trade_stream.next() => {
+            msg = stream.next() => {
                 match msg {
-                    Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
-                        if let Ok(trade) = serde_json::from_str::<AggTrade>(&text) {
-                            state.handle_trade(trade);
+                    Some(Ok(Message::Text(text))) => {
+                        match serde_json::from_str::<CoinbaseMessage>(&text) {
+                            Ok(CoinbaseMessage::Match { price, size, side }) => {
+                                state.handle_match(&price, &size, &side);
+                            }
+                            Ok(CoinbaseMessage::Snapshot { asks }) => {
+                                state.sell_wall.apply_snapshot(&asks);
+                            }
+                            Ok(CoinbaseMessage::L2Update { changes }) => {
+                                state.sell_wall.apply_changes(&changes);
+                                if state.current_price > 0.0 {
+                                    state.sell_wall.update_signal(state.current_price);
+                                }
+                            }
+                            _ => {}
                         }
                     }
-                    Some(Err(e)) => eprintln!("Trade stream error: {e}"),
+                    Some(Err(e)) => eprintln!("WebSocket error: {e}"),
                     None => {
-                        eprintln!("Trade stream closed, reconnecting…");
-                        let ws = connect_ws(trade_url).await;
-                        trade_stream = ws.fuse();
+                        eprintln!("WebSocket closed, reconnecting…");
+                        let ws = connect_ws_coinbase().await;
+                        stream = ws.fuse();
                     }
                     _ => {}
                 }
             }
-            msg = depth_stream.next() => {
-                match msg {
-                    Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
-                        if let Ok(depth) = serde_json::from_str::<DepthUpdate>(&text) {
-                            state.handle_depth(depth);
-                        }
-                    }
-                    Some(Err(e)) => eprintln!("Depth stream error: {e}"),
-                    None => {
-                        eprintln!("Depth stream closed, reconnecting…");
-                        let ws = connect_ws(depth_url).await;
-                        depth_stream = ws.fuse();
-                    }
-                    _ => {}
+            _ = ticker.tick() => {
+                if let Some(line) = state.on_tick() {
+                    println!("{line}");
                 }
-            }
-            _ = minute_timer.tick() => {
-                let now = Utc::now();
-                let ts = now.format("%H:%M:%S");
-
-                if state.current_price > 0.0 {
-                    let vwap = state.vwap.vwap();
-                    let vwap_str = if vwap > 0.0 {
-                        format!(" | VWAP: {}", format_usd(vwap))
-                    } else {
-                        String::new()
-                    };
-
-                    let suffix = if state.block_trade_count == 0 {
-                        " | ⚠️ No new trades".to_string()
-                    } else if state.prev_block_close_price > 0.0 {
-                        let diff = state.current_price - state.prev_block_close_price;
-                        format!(" | Change: {}", format_usd_change(diff))
-                    } else {
-                        String::new()
-                    };
-
-                    println!(
-                        "\n💰 [{ts}] BTC Price: {}{vwap_str}{suffix}",
-                        format_usd(state.current_price)
-                    );
-                }
-
-                // Reset block state for the new minute.
-                state.prev_block_close_price = state.current_price;
-                let minute = now.timestamp() as u32 / 60;
-                state.current_minute = minute;
-                state.vwap = VwapState::new();
-                state.delta.reset_block(state.current_price);
-                state.block_trade_count = 0;
             }
         }
     }
