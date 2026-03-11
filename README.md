@@ -13,7 +13,42 @@ The system opens a single connection to the **Coinbase Exchange WebSocket** (`ws
 | `matches` | Real-time trade price, size, and buy/sell side |
 | `level2_batch` | Level-2 order book snapshot + incremental updates |
 
-Every **5 seconds** the current price, 60-second rolling volume-weighted average, and 5-second price change are printed. Every **15 seconds** (at `:00`, `:15`, `:30`, `:45` of each minute) a **Reversal Risk Index (RRI)** is printed combining all 5 indicator scores into one clean, actionable number from 1.0 to 10.0.
+Every **1 second** (configurable) the current price and 30-second rolling VWAP are printed with percentage changes. Every **5 seconds** (every 5th tick, configurable) a **Reversal Risk Index (RRI)** is printed.
+
+Optionally, real-time **Kalshi YES/NO bid prices** for the nearest ATM 15-minute BTC contract are shown on a second line every tick.
+
+---
+
+## Configuration
+
+Copy `config.example.json` to `config.json` and edit to your preferences:
+
+```json
+{
+  "rri_alpha": 0.5,
+  "tick_interval_secs": 1,
+  "rri_check_every_n_ticks": 5,
+  "log_file": "rri_log.csv",
+  "log_retention_hours": 12,
+  "kalshi_api_key": "",
+  "kalshi_api_secret": "",
+  "kalshi_event_ticker": "KXBTCD"
+}
+```
+
+> **Note**: `config.json` is in `.gitignore` so your API keys are never committed.  
+> `config.example.json` is the safe template — fill in your keys in `config.json`.
+
+| Key | Default | What it does |
+|---|---|---|
+| `rri_alpha` | `0.5` | EMA smoothing factor. Raise (e.g. `0.7`) for raw-like responsiveness, lower (e.g. `0.3`) for more dampening |
+| `tick_interval_secs` | `1` | Price line printed every N seconds |
+| `rri_check_every_n_ticks` | `5` | RRI fires every Nth tick (5 × 1s = every 5s) |
+| `log_file` | `"rri_log.csv"` | Where RRI readings are appended |
+| `log_retention_hours` | `12` | Prune log entries older than this |
+| `kalshi_api_key` | `""` | Kalshi account email. Leave empty to disable Kalshi |
+| `kalshi_api_secret` | `""` | Kalshi account password. Leave empty to disable Kalshi |
+| `kalshi_event_ticker` | `"KXBTCD"` | Kalshi event ticker prefix for 15-minute BTC contracts |
 
 ---
 
@@ -23,15 +58,15 @@ Each indicator contributes a weighted sub-score. The raw RRI is their sum, floor
 
 ```rust
 let raw_rri = (delta_score + rsi_score + vwap_score + bb_score + wall_score).clamp(1.0, 10.0);
-// EMA smoothing (α = 0.3, ~1 minute window):
-smoothed_rri = 0.3 * raw_rri + 0.7 * smoothed_rri;
+// EMA smoothing (α = 0.5, ~10s convergence at 1s ticks):
+smoothed_rri = 0.5 * raw_rri + 0.5 * smoothed_rri;
 ```
 
 ### EMA Smoothing
 
 | Parameter | Value | Effect |
 |-----------|-------|--------|
-| Alpha (α) | 0.3 | ~4 readings / ~1 minute smoothing window |
+| Alpha (α) | 0.5 | ~2 readings / ~10 second smoothing window |
 | First reading | Initialised to raw RRI | No lag on start-up |
 
 The smoothed value is used for both the displayed score and the risk level label/emoji. The raw component scores in the bracket line are always the **unsmoothed** values so you can see exactly what is driving the RRI.
@@ -80,8 +115,8 @@ Tracks a rolling 5-minute volume-weighted average price. Entries older than 5 mi
 - `1.5` = 1.5–2.0σ from VWAP
 - `2.0` = > 2.0σ from VWAP
 
-### 2. Fast RSI — 2-Period RSI on 5-Second Closes
-A very short (2-period) Relative Strength Index calculated on **5-second candle closes** (12 updates per minute). RSI is computed from the last 50 five-second closes.
+### 2. Fast RSI — 2-Period RSI on 1-Second Closes
+A very short (2-period) Relative Strength Index calculated on **1-second candle closes**. RSI is computed from the last 50 closes.
 
 **Scoring**:
 - `0.0` = RSI 30–70 (neutral)
@@ -98,8 +133,8 @@ Accumulates buy minus sell volume in **15-second windows**. At each 15-second ch
 - `1.5` = Mild divergence (price moving one way, delta flat or weakly opposite)
 - `3.0` = Strong divergence (price moving one way, delta strongly the other)
 
-### 4. Bollinger Band Width — 5-Second Candle Closes
-Maintains a 20-period Bollinger Band on **5-second candle closes** (= 100 seconds of data). Updated at 5-second intervals.
+### 4. Bollinger Band Width — 1-Second Closes
+Maintains a 20-period Bollinger Band on **1-second closes** (= 20 seconds of data). Updated every tick.
 
 **Scoring** (band width percentage):
 - `0.0`  = band width > 0.10% (normal volatility)
@@ -108,7 +143,7 @@ Maintains a 20-period Bollinger Band on **5-second candle closes** (= 100 second
 - `1.5`  = band width < 0.03% (extreme squeeze)
 
 ### 5. Sell Wall Detection
-Scans the ask side of the live order book for large limit orders close to the current price. The order book is kept up-to-date from depth snapshots and incremental updates; the wall score is **only evaluated at the 15-second signal checkpoint**, not on every depth update.
+Scans the ask side of the live order book for large limit orders close to the current price. The order book is kept up-to-date from depth snapshots and incremental updates; the wall score is **only evaluated at the RRI checkpoint**, not on every depth update.
 
 **Scoring**:
 - `0.0` = No significant wall nearby
@@ -118,16 +153,18 @@ Scans the ask side of the live order book for large limit orders close to the cu
 
 ---
 
-## Output Cadence
+## Output Format
 
 ```
-0s          5s          10s         15s ← RRI CHECK
-│─────── price ──────────────────────│
-│─────── price ──────────────────────│─ RRI check ─│
+💰 [21:35:03] BTC: $70,648.36 (+0.12%) | 30s Avg: $70,645.20 (+0.04%)
+   📊 Kalshi YES: $0.62 (+3.3%) | NO: $0.38 (-5.0%)
+   🟡 RRI: 4.3/10 ↑ — MODERATE — Caution, some signals warming
+   [Delta: 1.5 | RSI: 2.0 | VWAP: 0.5 | BB: 1.50 | Wall: 0.0]
 ```
 
-- **Price line** — printed every 5 seconds
-- **RRI check** — printed every 15 seconds (every 3rd 5-second tick)
+- **Line 1** — BTC price every tick, with % change vs previous tick + 30s VWAP with % change
+- **Line 2** — Kalshi YES/NO bid prices (only shown when Kalshi credentials are configured)
+- **Lines 3–4** — RRI signal, printed every `rri_check_every_n_ticks` ticks
 
 ---
 
@@ -140,43 +177,27 @@ Scans the ask side of the live order book for large limit orders close to the cu
 ✅ Connected to wss://ws-feed.exchange.coinbase.com
 📡 Streaming live data — watching for reversals…
 
-💰 [19:31:00] BTC: $67,243.26 | 60s Avg: $67,240.15 | Δ5s: +$2.30
-💰 [19:31:05] BTC: $67,245.56 | 60s Avg: $67,241.20 | Δ5s: +$2.30
-💰 [19:31:10] BTC: $67,250.10 | 60s Avg: $67,243.50 | Δ5s: +$4.54
-💰 [19:31:15] BTC: $67,248.80 | 60s Avg: $67,244.10 | Δ5s: -$1.30
-   🟢 RRI: 1.8/10 → — LOW RISK — Safe to trade
-   [Delta: 0.0 | RSI: 0.5 | VWAP: 0.8 | BB: 0.50 | Wall: 0.0]
-
-💰 [19:31:20] BTC: $67,252.00 | 60s Avg: $67,245.60 | Δ5s: +$3.20
-💰 [19:31:25] BTC: $67,255.30 | 60s Avg: $67,247.80 | Δ5s: +$3.30
-💰 [19:31:30] BTC: $67,253.10 | 60s Avg: $67,248.90 | Δ5s: -$2.20
-   🟡 RRI: 2.8/10 ↑ — MODERATE — Caution, some signals warming
-   [Delta: 0.8 | RSI: 1.0 | VWAP: 1.0 | BB: 0.40 | Wall: 0.0]
-
-💰 [19:31:35] BTC: $67,249.50 | 60s Avg: $67,249.10 | Δ5s: -$3.60
-💰 [19:31:40] BTC: $67,247.20 | 60s Avg: $67,249.00 | Δ5s: -$2.30
-💰 [19:31:45] BTC: $67,244.80 | 60s Avg: $67,248.50 | Δ5s: -$2.40
-   🟠 RRI: 4.7/10 ↑ — ELEVATED — Reversal pressure building
-   [Delta: 2.1 | RSI: 1.5 | VWAP: 1.2 | BB: 0.50 | Wall: 0.5]
-
-💰 [19:31:50] BTC: $67,242.10 | 60s Avg: $67,247.80 | Δ5s: -$2.70
-💰 [19:31:55] BTC: $67,240.50 | 60s Avg: $67,247.00 | Δ5s: -$1.60
-💰 [19:32:00] BTC: $67,241.80 | 60s Avg: $67,246.50 | Δ5s: +$1.30
-   🟡 RRI: 3.6/10 ↓ — MODERATE — Caution, some signals warming
-   [Delta: 0.0 | RSI: 0.0 | VWAP: 0.3 | BB: 0.00 | Wall: 0.0]
+💰 [21:35:01] BTC: $70,648.36 (+0.00%) | 30s Avg: $70,645.20 (+0.00%)
+💰 [21:35:02] BTC: $70,648.80 (+0.01%) | 30s Avg: $70,645.50 (+0.00%)
+💰 [21:35:03] BTC: $70,649.30 (+0.01%) | 30s Avg: $70,645.90 (+0.01%)
+💰 [21:35:04] BTC: $70,649.00 (-0.00%) | 30s Avg: $70,645.85 (-0.00%)
+💰 [21:35:05] BTC: $70,648.70 (-0.00%) | 30s Avg: $70,645.70 (-0.00%)
+   🟡 RRI: 4.3/10 ↑ — MODERATE — Caution, some signals warming
+   [Delta: 1.5 | RSI: 2.0 | VWAP: 0.5 | BB: 1.50 | Wall: 0.0]
 ```
 
 ---
 
-## RRI Score Examples
+## RRI Log (`rri_log.csv`)
 
-| Example | RRI | Label | Component Breakdown |
-|---|---|---|---|
-| All clear | 1.8 | 🟢 LOW RISK | Delta: 0.2, RSI: 0.3, VWAP: 0.8, BB: 0.5, Wall: 0.0 |
-| Warming up | 3.2 | 🟡 MODERATE | Delta: 0.8, RSI: 1.0, VWAP: 1.0, BB: 0.4, Wall: 0.0 |
-| Building | 5.8 | 🟠 ELEVATED | Delta: 2.1, RSI: 1.5, VWAP: 1.2, BB: 0.5, Wall: 0.5 |
-| Danger | 7.2 | 🔴 HIGH RISK | Delta: 2.5, RSI: 2.0, VWAP: 1.5, BB: 0.7, Wall: 0.5 |
-| Extreme | 8.4 | 🚨 EXTREME | Delta: 2.8, RSI: 2.5, VWAP: 1.6, BB: 0.5, Wall: 1.0 |
+Every RRI checkpoint appends a line:
+
+```csv
+timestamp,smoothed_rri,raw_rri,trend,label,delta,rsi,vwap,bb,wall
+2026-03-11T14:31:15Z,4.3,5.5,↑,MODERATE,1.5,2.0,0.5,1.50,0.0
+```
+
+The log auto-prunes entries older than `log_retention_hours` (triggered every ~100 writes).
 
 ---
 
@@ -185,6 +206,13 @@ Scans the ask side of the live order book for large limit orders close to the cu
 ### Prerequisites
 
 - [Rust toolchain](https://rustup.rs/) (stable, edition 2021)
+
+### Setup
+
+```bash
+cp config.example.json config.json
+# Edit config.json to add your Kalshi credentials (optional)
+```
 
 ### Build
 
@@ -198,16 +226,20 @@ cargo build --release
 cargo run --release
 ```
 
-> **Note**: This application connects to **Coinbase Exchange** (`wss://ws-feed.exchange.coinbase.com`), which is fully available in the US with no regional restrictions. No API keys are required — the feed is public.
+> **Note**: This application connects to **Coinbase Exchange** (`wss://ws-feed.exchange.coinbase.com`), which is fully available in the US with no regional restrictions. No API keys are required for the BTC price feed — it is public.
 
 ---
 
-## Update Interval & Rolling Average
+## Kalshi Integration
 
-- **Price line** is printed every **5 seconds**.
-- **RRI summary** is printed every **15 seconds** at `:00`, `:15`, `:30`, `:45` of each minute.
-- **60-second rolling average** (`60s Avg`) is a volume-weighted average of all trades in the last 60 seconds. If no trades have occurred in that window, the last known value is shown with a `⚠️ Stale` warning.
-- **Δ5s** shows the price change since the previous 5-second tick.
+When `kalshi_api_key` and `kalshi_api_secret` are set in `config.json`, the app will:
+
+1. Authenticate with the Kalshi REST API
+2. Find the nearest ATM 15-minute BTC contract currently open
+3. Open a WebSocket to stream real-time YES/NO bid prices
+4. Automatically roll to the new contract as 15-minute windows expire
+
+If credentials are empty, the Kalshi line is simply not printed.
 
 ---
 
