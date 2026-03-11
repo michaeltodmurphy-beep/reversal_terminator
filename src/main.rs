@@ -743,9 +743,9 @@ impl AppState {
                     "   📊 Kalshi: awaiting data…".to_string()
                 } else {
                     let yes_pct = pct_change_str(ks.prev_yes_bid, ks.yes_bid);
-                    let no_pct  = pct_change_str(ks.prev_no_bid,  ks.no_bid);
+                    let no_pct = pct_change_str(ks.prev_no_bid, ks.no_bid);
                     ks.prev_yes_bid = ks.yes_bid;
-                    ks.prev_no_bid  = ks.no_bid;
+                    ks.prev_no_bid = ks.no_bid;
                     format!(
                         "   📊 Kalshi YES: ${:.2} ({yes_pct}) | NO: ${:.2} ({no_pct})",
                         ks.yes_bid, ks.no_bid
@@ -964,7 +964,7 @@ async fn kalshi_find_atm_contract(
             .unwrap_or(0);
 
         // Accept contracts expiring in the next 15 minutes.
-        if exp_ts <= now_ts || exp_ts > now_ts + fifteen_min_secs {
+        if exp_ts < now_ts || exp_ts > now_ts + fifteen_min_secs {
             continue;
         }
 
@@ -1155,7 +1155,7 @@ fn kalshi_handle_message(msg: &serde_json::Value, state: &Arc<Mutex<KalshiState>
             arr.iter()
                 .filter_map(|entry| {
                     let price = entry[0].as_f64()?;
-                    let size  = entry[1].as_f64().unwrap_or(0.0);
+                    let size = entry[1].as_f64().unwrap_or(0.0);
                     if size > 0.0 { Some(price) } else { None }
                 })
                 .reduce(f64::max)
@@ -1168,7 +1168,7 @@ fn kalshi_handle_message(msg: &serde_json::Value, state: &Arc<Mutex<KalshiState>
             arr.iter()
                 .filter_map(|entry| {
                     let price = entry[0].as_f64()?;
-                    let size  = entry[1].as_f64().unwrap_or(0.0);
+                    let size = entry[1].as_f64().unwrap_or(0.0);
                     if size > 0.0 { Some(price) } else { None }
                 })
                 .reduce(f64::max)
