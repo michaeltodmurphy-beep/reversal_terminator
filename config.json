@@ -1,7 +1,0 @@
-{
-  "rri_alpha": 0.5,
-  "tick_interval_secs": 1,
-  "rri_check_every_n_ticks": 5,
-  "log_file": "rri_log.csv",
-  "log_retention_hours": 12
-}

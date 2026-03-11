@@ -3,6 +3,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, Write};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use url::Url;
@@ -22,6 +23,19 @@ struct Config {
     log_file: String,
     /// How many hours of RRI log data to retain.
     log_retention_hours: u64,
+    /// Kalshi API key (email). Leave empty to disable Kalshi integration.
+    #[serde(default)]
+    kalshi_api_key: String,
+    /// Kalshi API secret (password). Leave empty to disable Kalshi integration.
+    #[serde(default)]
+    kalshi_api_secret: String,
+    /// Kalshi event ticker prefix for 15-minute BTC contracts (e.g. "KXBTCD").
+    #[serde(default = "default_kalshi_event_ticker")]
+    kalshi_event_ticker: String,
+}
+
+fn default_kalshi_event_ticker() -> String {
+    "KXBTCD".to_string()
 }
 
 impl Default for Config {
@@ -32,6 +46,9 @@ impl Default for Config {
             rri_check_every_n_ticks: 5,
             log_file: "rri_log.csv".to_string(),
             log_retention_hours: 12,
+            kalshi_api_key: String::new(),
+            kalshi_api_secret: String::new(),
+            kalshi_event_ticker: default_kalshi_event_ticker(),
         }
     }
 }
@@ -73,6 +90,40 @@ struct TimedTrade {
     price: f64,
     volume: f64,
     timestamp_ms: u64,
+}
+
+// ── Kalshi state ───────────────────────────────────────────────────────────
+
+/// Real-time Kalshi YES/NO bid state for the active 15-minute BTC contract.
+struct KalshiState {
+    /// Current YES bid price (0.0–1.0).
+    yes_bid: f64,
+    /// Current NO bid price (0.0–1.0).
+    no_bid: f64,
+    /// YES bid at the previous tick (for % change display).
+    prev_yes_bid: f64,
+    /// NO bid at the previous tick (for % change display).
+    prev_no_bid: f64,
+    /// Ticker of the currently subscribed contract.
+    active_ticker: String,
+    /// Whether the WebSocket connection is live.
+    connected: bool,
+    /// True when there is no active contract for the current window.
+    no_contract: bool,
+}
+
+impl KalshiState {
+    fn new() -> Self {
+        Self {
+            yes_bid: 0.0,
+            no_bid: 0.0,
+            prev_yes_bid: 0.0,
+            prev_no_bid: 0.0,
+            active_ticker: String::new(),
+            connected: false,
+            no_contract: false,
+        }
+    }
 }
 
 // ── Indicator state ────────────────────────────────────────────────────────
@@ -497,10 +548,18 @@ fn format_usd(value: f64) -> String {
     format!("${comma_str}.{frac:02}")
 }
 
-/// Formats a signed USD change as `+$X,XXX.XX` or `-$X,XXX.XX`.
-fn format_usd_change(value: f64) -> String {
-    let sign = if value >= 0.0 { "+" } else { "-" };
-    format!("{sign}{}", format_usd(value.abs()))
+/// Formats a percentage change as `+X.XX%` or `-X.XX%`.
+/// Returns `+0.00%` when `prev` is zero (first tick).
+fn pct_change_str(prev: f64, current: f64) -> String {
+    if prev == 0.0 {
+        return "+0.00%".to_string();
+    }
+    let pct = (current - prev) / prev * 100.0;
+    if pct >= 0.0 {
+        format!("+{pct:.2}%")
+    } else {
+        format!("{pct:.2}%")
+    }
 }
 
 // ── RRI helpers ────────────────────────────────────────────────────────────
@@ -533,16 +592,14 @@ struct AppState {
     trade_count: u64,
     /// Tick counter, used to determine RRI checkpoints.
     tick_count: u64,
-    /// Rolling 60-second trade buffer for volume-weighted average.
+    /// Rolling trade buffer (kept for up to 60 seconds) for volume-weighted averages.
     rolling_trades: VecDeque<TimedTrade>,
-    /// Most recently calculated 60-second rolling average (kept for "Stale" display).
-    rolling_60s_avg: f64,
-    /// Most recently calculated 5-second rolling average.
-    rolling_5s_avg: f64,
-    /// Previous tick's 5-second rolling average, for inter-line delta.
-    prev_5s_avg: f64,
-    /// Price at the previous tick, for Δ calculation.
-    prev_tick_price: f64,
+    /// Most recently calculated 30-second rolling VWAP.
+    rolling_30s_avg: f64,
+    /// Previous tick's 30-second rolling VWAP, for percentage-change display.
+    prev_30s_avg: f64,
+    /// Price at the previous tick, for percentage-change display.
+    prev_price: f64,
     /// EMA-smoothed RRI value displayed to the user.
     smoothed_rri: f64,
     /// Previous smoothed RRI value, used to compute the trend arrow.
@@ -553,8 +610,6 @@ struct AppState {
     // ── Config-driven fields ───────────────────────────────────────────────
     /// EMA smoothing factor for the RRI.
     rri_alpha: f64,
-    /// How often (in seconds) a price line is printed.
-    tick_interval_secs: u64,
     /// RRI check fires every N ticks.
     rri_check_every_n_ticks: u64,
     /// Path to the CSV log file for RRI readings.
@@ -578,16 +633,14 @@ impl AppState {
             trade_count: 0,
             tick_count: 0,
             rolling_trades: VecDeque::new(),
-            rolling_60s_avg: 0.0,
-            rolling_5s_avg: 0.0,
-            prev_5s_avg: 0.0,
-            prev_tick_price: 0.0,
+            rolling_30s_avg: 0.0,
+            prev_30s_avg: 0.0,
+            prev_price: 0.0,
             smoothed_rri: 0.0,
             previous_smoothed_rri: 0.0,
             rri_initialized: false,
 
             rri_alpha: config.rri_alpha,
-            tick_interval_secs: config.tick_interval_secs,
             rri_check_every_n_ticks: config.rri_check_every_n_ticks,
             log_file: config.log_file.clone(),
             log_retention_hours: config.log_retention_hours,
@@ -596,7 +649,7 @@ impl AppState {
     }
 
     /// Process a `match` message: silently update state, no printing.
-    /// RSI and Bollinger are updated at 5-second candle closes (in `on_tick`),
+    /// RSI and Bollinger are updated at tick closes (in `on_tick`),
     /// not on every individual trade.
     fn handle_match(&mut self, price_str: &str, size_str: &str, side: &str) {
         let price: f64 = price_str.parse().unwrap_or(0.0);
@@ -618,11 +671,11 @@ impl AppState {
         self.delta.update(price, qty, side == "sell");
     }
 
-    /// Called on every 5-second tick. Updates 5-second candle-based indicators,
-    /// evicts stale rolling trades, recalculates the 60-second average, and
-    /// returns the formatted output lines (always a price line, plus a signal
-    /// summary line every 15 seconds).
-    fn on_tick(&mut self) -> Vec<String> {
+    /// Called on every tick. Updates candle-based indicators, evicts stale
+    /// rolling trades, recalculates the 30-second VWAP, and returns the
+    /// formatted output lines (always a price line, plus a signal summary line
+    /// every `rri_check_every_n_ticks` ticks).
+    fn on_tick(&mut self, kalshi: Option<&Arc<Mutex<KalshiState>>>) -> Vec<String> {
         let mut output = Vec::new();
 
         if self.current_price == 0.0 {
@@ -634,78 +687,79 @@ impl AppState {
         let ts = now.format("%H:%M:%S");
         let now_ms = now.timestamp_millis() as u64;
 
-        // Update 5-second candle-based indicators with the current close price.
+        // Update tick-close indicators with the current price.
         self.rsi.update(self.current_price);
         self.bollinger.update(self.current_price);
 
-        // Evict trades older than 60 seconds from the rolling buffer.
+        // Evict trades older than 60 seconds (we keep 60s to support potential
+        // future averages; current display uses 30s).
         let cutoff_ms = now_ms.saturating_sub(60_000);
         while self.rolling_trades.front().is_some_and(|t| t.timestamp_ms < cutoff_ms) {
             self.rolling_trades.pop_front();
         }
 
-        // Calculate the 60-second volume-weighted average.
-        let avg_str = if self.rolling_trades.is_empty() {
-            if self.rolling_60s_avg > 0.0 {
-                format!("{} ⚠️ Stale", format_usd(self.rolling_60s_avg))
-            } else {
-                "N/A".to_string()
-            }
-        } else {
-            let (total_pv, total_vol) = self.rolling_trades.iter().fold(
-                (0.0f64, 0.0f64),
-                |(pv, v), t| (pv + t.price * t.volume, v + t.volume),
-            );
-            if total_vol > 0.0 {
-                self.rolling_60s_avg = total_pv / total_vol;
-            }
-            format_usd(self.rolling_60s_avg)
-        };
-
-        // Calculate the 5-second volume-weighted average.
-        let cutoff_5s_ms = now_ms.saturating_sub(5_000);
-        let (pv_5s, vol_5s) = self.rolling_trades.iter()
-            .filter(|t| t.timestamp_ms >= cutoff_5s_ms)
+        // Calculate the 30-second volume-weighted average.
+        let cutoff_30s_ms = now_ms.saturating_sub(30_000);
+        let (pv_30s, vol_30s) = self.rolling_trades.iter()
+            .filter(|t| t.timestamp_ms >= cutoff_30s_ms)
             .fold((0.0f64, 0.0f64), |(pv, v), t| (pv + t.price * t.volume, v + t.volume));
 
-        let avg_5s_str = if vol_5s > 0.0 {
-            self.rolling_5s_avg = pv_5s / vol_5s;
-            format_usd(self.rolling_5s_avg)
-        } else if self.rolling_5s_avg > 0.0 {
-            format!("{} ⚠️ Stale", format_usd(self.rolling_5s_avg))
+        let new_30s_avg = if vol_30s > 0.0 {
+            pv_30s / vol_30s
+        } else {
+            self.rolling_30s_avg // keep last known value when no trades in window
+        };
+
+        // Percentage changes (vs. previous tick).
+        let price_pct_str = pct_change_str(self.prev_price, self.current_price);
+        let avg_30s_pct_str = pct_change_str(self.prev_30s_avg, new_30s_avg);
+
+        self.prev_price = self.current_price;
+        self.prev_30s_avg = self.rolling_30s_avg;
+        self.rolling_30s_avg = new_30s_avg;
+
+        // ── Line 1: BTC price ──────────────────────────────────────────────
+        let avg_30s_display = if self.rolling_30s_avg > 0.0 {
+            format_usd(self.rolling_30s_avg)
         } else {
             "N/A".to_string()
         };
-
-        // Inter-line delta: change in 5s avg since the previous tick.
-        let delta_5s_str = if self.prev_5s_avg > 0.0 && self.rolling_5s_avg > 0.0 {
-            let delta = self.rolling_5s_avg - self.prev_5s_avg;
-            format!(" (Δ: {})", format_usd_change(delta))
-        } else {
-            String::new()
-        };
-        self.prev_5s_avg = self.rolling_5s_avg;
-
-        let delta_str = if self.prev_tick_price > 0.0 {
-            let delta_tick = self.current_price - self.prev_tick_price;
-            format!(" | Δ{}s: {}", self.tick_interval_secs, format_usd_change(delta_tick))
-        } else {
-            String::new()
-        };
-
-        self.prev_tick_price = self.current_price;
-
-        // Price line — printed every 5 seconds.
         output.push(format!(
-            "💰 [{ts}] BTC: {} | 5s Avg: {avg_5s_str}{delta_5s_str} | 60s Avg: {avg_str}{delta_str}",
+            "💰 [{ts}] BTC: {} ({price_pct_str}) | 30s Avg: {avg_30s_display} ({avg_30s_pct_str})",
             format_usd(self.current_price)
         ));
 
-        // Signal check — printed every N ticks (configured by rri_check_every_n_ticks).
+        // ── Line 2: Kalshi YES/NO bids ─────────────────────────────────────
+        if let Some(kalshi_arc) = kalshi {
+            let kalshi_line = {
+                let mut ks = kalshi_arc.lock().unwrap();
+                if !ks.connected {
+                    if ks.no_contract {
+                        "   📊 Kalshi: no active contract".to_string()
+                    } else {
+                        "   📊 Kalshi: disconnected".to_string()
+                    }
+                } else if ks.yes_bid == 0.0 && ks.no_bid == 0.0 {
+                    "   📊 Kalshi: awaiting data…".to_string()
+                } else {
+                    let yes_pct = pct_change_str(ks.prev_yes_bid, ks.yes_bid);
+                    let no_pct = pct_change_str(ks.prev_no_bid, ks.no_bid);
+                    ks.prev_yes_bid = ks.yes_bid;
+                    ks.prev_no_bid = ks.no_bid;
+                    format!(
+                        "   📊 Kalshi YES: ${:.2} ({yes_pct}) | NO: ${:.2} ({no_pct})",
+                        ks.yes_bid, ks.no_bid
+                    )
+                }
+            };
+            output.push(kalshi_line);
+        }
+
+        // ── Lines 3-4: RRI signal (every N ticks) ─────────────────────────
         if self.tick_count % self.rri_check_every_n_ticks == 0 {
             let price = self.current_price;
 
-            // Finalise the 15-second delta window before scoring.
+            // Finalise the delta window before scoring.
             self.delta.finalize_window(price);
 
             // Calculate the composite Reversal Risk Index.
@@ -833,7 +887,301 @@ impl AppState {
     }
 }
 
-// ── WebSocket task helpers ─────────────────────────────────────────────────
+// ── Kalshi WebSocket task ──────────────────────────────────────────────────
+
+const KALSHI_WS_URL: &str = "wss://api.elections.kalshi.com/trade-api/ws/v2";
+const KALSHI_REST_BASE: &str = "https://api.elections.kalshi.com/trade-api/v2";
+
+/// Authenticate with the Kalshi REST API using email/password credentials.
+/// Returns a session token on success.
+async fn kalshi_login(api_key: &str, api_secret: &str) -> Option<String> {
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({
+        "email":    api_key,
+        "password": api_secret,
+    });
+    let url = format!("{KALSHI_REST_BASE}/login");
+    match client.post(&url).json(&body).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            match resp.json::<serde_json::Value>().await {
+                Ok(v) => v["token"].as_str().map(|s| s.to_string()),
+                Err(e) => {
+                    eprintln!("Kalshi login parse error: {e}");
+                    None
+                }
+            }
+        }
+        Ok(resp) => {
+            eprintln!("Kalshi login failed: HTTP {}", resp.status());
+            None
+        }
+        Err(e) => {
+            eprintln!("Kalshi login request error: {e}");
+            None
+        }
+    }
+}
+
+/// Query the Kalshi REST API to find the nearest ATM 15-minute BTC contract
+/// expiring in the current (or next) 15-minute window.  Returns the market
+/// ticker on success.
+async fn kalshi_find_atm_contract(
+    token: &str,
+    event_ticker: &str,
+    current_btc_price: f64,
+) -> Option<String> {
+    let client = reqwest::Client::new();
+    let url = format!("{KALSHI_REST_BASE}/markets?event_ticker={event_ticker}&status=open&limit=100");
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .ok()?;
+
+    if !resp.status().is_success() {
+        eprintln!("Kalshi markets query failed: HTTP {}", resp.status());
+        return None;
+    }
+
+    let data: serde_json::Value = resp.json().await.ok()?;
+    let markets = data["markets"].as_array()?;
+
+    // Filter to markets that are still open and pick the one whose strike
+    // (cap_strike or floor_strike field) is closest to the current price.
+    let now_ts = Utc::now().timestamp();
+    let fifteen_min_secs: i64 = 15 * 60;
+
+    let mut best_ticker: Option<String> = None;
+    let mut best_dist = f64::MAX;
+
+    for market in markets {
+        // Only consider markets expiring within the current 15-minute window.
+        let exp_ts = market["expiration_time"]
+            .as_str()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.timestamp())
+            .unwrap_or(0);
+
+        // Accept contracts expiring in the next 15 minutes.
+        if exp_ts < now_ts || exp_ts > now_ts + fifteen_min_secs {
+            continue;
+        }
+
+        // Use the floor_strike (lower bound of the price range) as the ATM proxy.
+        let strike = market["floor_strike"]
+            .as_f64()
+            .or_else(|| market["cap_strike"].as_f64())
+            .unwrap_or(0.0);
+
+        if strike == 0.0 {
+            continue;
+        }
+
+        let dist = (strike - current_btc_price).abs();
+        if dist < best_dist {
+            best_dist = dist;
+            best_ticker = market["ticker"].as_str().map(|s| s.to_string());
+        }
+    }
+
+    best_ticker
+}
+
+/// Background task: authenticates with Kalshi, finds the nearest ATM contract,
+/// opens a WebSocket, subscribes to its orderbook, and continuously updates
+/// the shared `KalshiState`.  Reconnects automatically on failure.
+async fn run_kalshi_task(
+    api_key: String,
+    api_secret: String,
+    event_ticker: String,
+    state: Arc<Mutex<KalshiState>>,
+    current_price_ref: Arc<Mutex<f64>>,
+) {
+    // Outer loop: re-authenticate and reconnect from scratch on any hard failure.
+    loop {
+        // Authenticate.
+        let token = match kalshi_login(&api_key, &api_secret).await {
+            Some(t) => t,
+            None => {
+                eprintln!("Kalshi auth failed, retrying in 30s…");
+                {
+                    let mut ks = state.lock().unwrap();
+                    ks.connected = false;
+                }
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                continue;
+            }
+        };
+
+        // Find ATM contract.
+        let btc_price = { *current_price_ref.lock().unwrap() };
+        let ticker = match kalshi_find_atm_contract(&token, &event_ticker, btc_price).await {
+            Some(t) => t,
+            None => {
+                eprintln!("Kalshi: no active contract found, retrying in 60s…");
+                {
+                    let mut ks = state.lock().unwrap();
+                    ks.connected = false;
+                    ks.no_contract = true;
+                }
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                continue;
+            }
+        };
+
+        {
+            let mut ks = state.lock().unwrap();
+            ks.active_ticker = ticker.clone();
+            ks.no_contract = false;
+        }
+
+        // Connect WebSocket.
+        let ws_url = Url::parse(KALSHI_WS_URL).expect("invalid Kalshi WS URL");
+        let ws = match connect_async(ws_url).await {
+            Ok((ws, _)) => ws,
+            Err(e) => {
+                eprintln!("Kalshi WS connect failed ({e}), retrying in 10s…");
+                {
+                    let mut ks = state.lock().unwrap();
+                    ks.connected = false;
+                }
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                continue;
+            }
+        };
+
+        let (mut sink, mut stream) = ws.split();
+
+        // Authenticate over the WebSocket connection.
+        let auth_msg = serde_json::json!({
+            "id": 1,
+            "cmd": "auth",
+            "params": { "token": token }
+        });
+        if sink.send(Message::Text(auth_msg.to_string())).await.is_err() {
+            eprintln!("Kalshi WS auth send failed, reconnecting…");
+            continue;
+        }
+
+        // Subscribe to the orderbook for the active contract.
+        let sub_msg = serde_json::json!({
+            "id": 2,
+            "cmd": "subscribe",
+            "params": {
+                "channels": ["orderbook_delta"],
+                "market_tickers": [ticker]
+            }
+        });
+        if sink.send(Message::Text(sub_msg.to_string())).await.is_err() {
+            eprintln!("Kalshi WS subscribe send failed, reconnecting…");
+            continue;
+        }
+
+        {
+            let mut ks = state.lock().unwrap();
+            ks.connected = true;
+        }
+
+        // Contract refresh timer: re-evaluate the active contract every 60s.
+        let mut refresh_ticker = tokio::time::interval(Duration::from_secs(60));
+        refresh_ticker.reset();
+
+        // Inner loop: process incoming messages.
+        loop {
+            tokio::select! {
+                msg = stream.next() => {
+                    match msg {
+                        Some(Ok(Message::Text(text))) => {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                                kalshi_handle_message(&v, &state);
+                            }
+                        }
+                        Some(Err(e)) => {
+                            eprintln!("Kalshi WS error: {e}");
+                            break;
+                        }
+                        None => {
+                            eprintln!("Kalshi WS closed, reconnecting…");
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                _ = refresh_ticker.tick() => {
+                    // Check whether a newer ATM contract has become active.
+                    let btc = { *current_price_ref.lock().unwrap() };
+                    if btc > 0.0 {
+                        if let Some(new_ticker) = kalshi_find_atm_contract(&token, &event_ticker, btc).await {
+                            let current = {
+                                let ks = state.lock().unwrap();
+                                ks.active_ticker.clone()
+                            };
+                            if new_ticker != current {
+                                // Roll to the new contract by breaking out to reconnect.
+                                eprintln!("Kalshi: rolling contract from {current} → {new_ticker}");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        {
+            let mut ks = state.lock().unwrap();
+            ks.connected = false;
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+/// Parse a Kalshi WebSocket message and update the shared state with the
+/// latest YES/NO bid prices.
+fn kalshi_handle_message(msg: &serde_json::Value, state: &Arc<Mutex<KalshiState>>) {
+    // Kalshi orderbook_delta messages carry bid prices in `yes` and `no` fields
+    // within the `msg` payload.  The prices are in cents (0–100).
+    let msg_type = msg["type"].as_str().unwrap_or("");
+    if msg_type != "orderbook_delta" && msg_type != "orderbook_snapshot" {
+        return;
+    }
+
+    let payload = &msg["msg"];
+
+    // Extract best YES bid.
+    let yes_bid_cents = payload["yes"]
+        .as_array()
+        .and_then(|arr| {
+            arr.iter()
+                .filter_map(|entry| {
+                    let price = entry[0].as_f64()?;
+                    let size = entry[1].as_f64().unwrap_or(0.0);
+                    if size > 0.0 { Some(price) } else { None }
+                })
+                .reduce(f64::max)
+        });
+
+    // Extract best NO bid.
+    let no_bid_cents = payload["no"]
+        .as_array()
+        .and_then(|arr| {
+            arr.iter()
+                .filter_map(|entry| {
+                    let price = entry[0].as_f64()?;
+                    let size = entry[1].as_f64().unwrap_or(0.0);
+                    if size > 0.0 { Some(price) } else { None }
+                })
+                .reduce(f64::max)
+        });
+
+    let mut ks = state.lock().unwrap();
+    if let Some(c) = yes_bid_cents {
+        ks.yes_bid = c / 100.0;
+    }
+    if let Some(c) = no_bid_cents {
+        ks.no_bid = c / 100.0;
+    }
+}
 
 const COINBASE_URL: &str = "wss://ws-feed.exchange.coinbase.com";
 
@@ -879,9 +1227,17 @@ async fn main() {
         .and_then(|s| serde_json::from_str::<Config>(&s).ok())
         .unwrap_or_default();
 
-    println!("📋 Config: rri_alpha={} | tick={}s | rri_every={}t | log={} | retention={}h",
-        config.rri_alpha, config.tick_interval_secs, config.rri_check_every_n_ticks,
-        config.log_file, config.log_retention_hours);
+    let kalshi_enabled = !config.kalshi_api_key.is_empty() && !config.kalshi_api_secret.is_empty();
+
+    println!(
+        "📋 Config: rri_alpha={} | tick={}s | rri_every={}t | log={} | retention={}h | kalshi={}",
+        config.rri_alpha,
+        config.tick_interval_secs,
+        config.rri_check_every_n_ticks,
+        config.log_file,
+        config.log_retention_hours,
+        if kalshi_enabled { "enabled" } else { "disabled (no credentials)" },
+    );
     println!("   Connecting to Coinbase Exchange WebSocket…\n");
 
     let ws = connect_ws_coinbase().await;
@@ -890,6 +1246,26 @@ async fn main() {
     let tick_secs = config.tick_interval_secs;
     let mut state = AppState::new(&config);
     let mut ticker = tokio::time::interval(Duration::from_secs(tick_secs));
+
+    // Shared current BTC price for Kalshi contract discovery.
+    let shared_btc_price: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
+
+    // Kalshi shared state + background task.
+    let kalshi_state: Option<Arc<Mutex<KalshiState>>> = if kalshi_enabled {
+        let ks = Arc::new(Mutex::new(KalshiState::new()));
+        let ks_clone = ks.clone();
+        let price_clone = shared_btc_price.clone();
+        tokio::spawn(run_kalshi_task(
+            config.kalshi_api_key.clone(),
+            config.kalshi_api_secret.clone(),
+            config.kalshi_event_ticker.clone(),
+            ks_clone,
+            price_clone,
+        ));
+        Some(ks)
+    } else {
+        None
+    };
 
     println!("📡 Streaming live data — watching for reversals…\n");
 
@@ -901,6 +1277,10 @@ async fn main() {
                         match serde_json::from_str::<CoinbaseMessage>(&text) {
                             Ok(CoinbaseMessage::Match { price, size, side }) => {
                                 state.handle_match(&price, &size, &side);
+                                // Keep shared price up-to-date for Kalshi contract selection.
+                                if let Ok(p) = price.parse::<f64>() {
+                                    *shared_btc_price.lock().unwrap() = p;
+                                }
                             }
                             Ok(CoinbaseMessage::Snapshot { asks }) => {
                                 state.sell_wall.apply_snapshot(&asks);
@@ -923,7 +1303,7 @@ async fn main() {
                 }
             }
             _ = ticker.tick() => {
-                for line in state.on_tick() {
+                for line in state.on_tick(kalshi_state.as_ref()) {
                     println!("{line}");
                 }
             }
