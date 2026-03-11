@@ -2,9 +2,39 @@ use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::collections::{BTreeMap, VecDeque};
+use std::io::{BufRead, Write};
 use std::time::Duration;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use url::Url;
+
+// ── Configuration ──────────────────────────────────────────────────────────
+
+/// Runtime configuration loaded from `config.json` at startup.
+#[derive(Deserialize)]
+struct Config {
+    /// EMA smoothing factor for the RRI. Higher = more responsive.
+    rri_alpha: f64,
+    /// How often (in seconds) a price line is printed.
+    tick_interval_secs: u64,
+    /// RRI check fires every N ticks.
+    rri_check_every_n_ticks: u64,
+    /// Path to the CSV log file for RRI readings.
+    log_file: String,
+    /// How many hours of RRI log data to retain.
+    log_retention_hours: u64,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            rri_alpha: 0.5,
+            tick_interval_secs: 1,
+            rri_check_every_n_ticks: 5,
+            log_file: "rri_log.csv".to_string(),
+            log_retention_hours: 12,
+        }
+    }
+}
 
 // ── Coinbase message types ──────────────────────────────────────────────────
 
@@ -473,12 +503,7 @@ fn format_usd_change(value: f64) -> String {
     format!("{sign}{}", format_usd(value.abs()))
 }
 
-// ── Timing helpers ─────────────────────────────────────────────────────────
-
 // ── RRI helpers ────────────────────────────────────────────────────────────
-
-/// EMA smoothing factor for the RRI (~4 readings / ~1 minute window).
-const RRI_ALPHA: f64 = 0.3;
 
 /// Maps an RRI score to (emoji, label, short meaning).
 fn rri_label(rri: f64) -> (&'static str, &'static str, &'static str) {
@@ -506,24 +531,38 @@ struct AppState {
 
     current_price: f64,
     trade_count: u64,
-    /// 5-second tick counter, used to determine 15-second checkpoints.
+    /// Tick counter, used to determine RRI checkpoints.
     tick_count: u64,
     /// Rolling 60-second trade buffer for volume-weighted average.
     rolling_trades: VecDeque<TimedTrade>,
     /// Most recently calculated 60-second rolling average (kept for "Stale" display).
     rolling_60s_avg: f64,
-    /// Price at the previous 5-second tick, for Δ5s calculation.
-    prev_5s_price: f64,
+    /// Price at the previous tick, for Δ calculation.
+    prev_tick_price: f64,
     /// EMA-smoothed RRI value displayed to the user.
     smoothed_rri: f64,
     /// Previous smoothed RRI value, used to compute the trend arrow.
     previous_smoothed_rri: f64,
     /// False until the first RRI reading has been processed.
     rri_initialized: bool,
+
+    // ── Config-driven fields ───────────────────────────────────────────────
+    /// EMA smoothing factor for the RRI.
+    rri_alpha: f64,
+    /// How often (in seconds) a price line is printed.
+    tick_interval_secs: u64,
+    /// RRI check fires every N ticks.
+    rri_check_every_n_ticks: u64,
+    /// Path to the CSV log file for RRI readings.
+    log_file: String,
+    /// How many hours of RRI log data to retain.
+    log_retention_hours: u64,
+    /// Counts RRI log writes; used to trigger periodic pruning.
+    rri_write_count: u64,
 }
 
 impl AppState {
-    fn new() -> Self {
+    fn new(config: &Config) -> Self {
         Self {
             vwap: VwapState::new(),
             rsi: RsiState::new(),
@@ -536,10 +575,17 @@ impl AppState {
             tick_count: 0,
             rolling_trades: VecDeque::new(),
             rolling_60s_avg: 0.0,
-            prev_5s_price: 0.0,
+            prev_tick_price: 0.0,
             smoothed_rri: 0.0,
             previous_smoothed_rri: 0.0,
             rri_initialized: false,
+
+            rri_alpha: config.rri_alpha,
+            tick_interval_secs: config.tick_interval_secs,
+            rri_check_every_n_ticks: config.rri_check_every_n_ticks,
+            log_file: config.log_file.clone(),
+            log_retention_hours: config.log_retention_hours,
+            rri_write_count: 0,
         }
     }
 
@@ -610,14 +656,14 @@ impl AppState {
             format_usd(self.rolling_60s_avg)
         };
 
-        let delta_str = if self.prev_5s_price > 0.0 {
-            let delta_5s = self.current_price - self.prev_5s_price;
-            format!(" | Δ5s: {}", format_usd_change(delta_5s))
+        let delta_str = if self.prev_tick_price > 0.0 {
+            let delta_tick = self.current_price - self.prev_tick_price;
+            format!(" | Δ{}s: {}", self.tick_interval_secs, format_usd_change(delta_tick))
         } else {
             String::new()
         };
 
-        self.prev_5s_price = self.current_price;
+        self.prev_tick_price = self.current_price;
 
         // Price line — printed every 5 seconds.
         output.push(format!(
@@ -625,8 +671,8 @@ impl AppState {
             format_usd(self.current_price)
         ));
 
-        // Signal check — printed every 15 seconds (every 3rd tick).
-        if self.tick_count % 3 == 0 {
+        // Signal check — printed every N ticks (configured by rri_check_every_n_ticks).
+        if self.tick_count % self.rri_check_every_n_ticks == 0 {
             let price = self.current_price;
 
             // Finalise the 15-second delta window before scoring.
@@ -644,7 +690,7 @@ impl AppState {
             } else {
                 self.previous_smoothed_rri = self.smoothed_rri;
                 self.smoothed_rri =
-                    (RRI_ALPHA * raw_rri) + ((1.0 - RRI_ALPHA) * self.smoothed_rri);
+                    (self.rri_alpha * raw_rri) + ((1.0 - self.rri_alpha) * self.smoothed_rri);
             }
 
             // Derive trend arrow from change in smoothed RRI.
@@ -668,6 +714,13 @@ impl AppState {
             );
 
             output.push(signal_line);
+
+            // Append this reading to the rolling RRI log.
+            let log_ts = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+            self.append_rri_log(
+                &log_ts, raw_rri, trend_arrow, label,
+                delta_score, rsi_score, vwap_score, bb_score, wall_score,
+            );
         }
 
         output
@@ -684,6 +737,69 @@ impl AppState {
         let total = (delta_score + rsi_score + vwap_score + bb_score + wall_score)
             .clamp(1.0, 10.0);
         (total, delta_score, rsi_score, vwap_score, bb_score, wall_score)
+    }
+
+    /// Append an RRI reading to the rolling CSV log file.
+    fn append_rri_log(
+        &mut self,
+        timestamp: &str,
+        raw_rri: f64,
+        trend: &str,
+        label: &str,
+        delta_score: f64,
+        rsi_score: f64,
+        vwap_score: f64,
+        bb_score: f64,
+        wall_score: f64,
+    ) {
+        let needs_header = !std::path::Path::new(&self.log_file).exists();
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&self.log_file) {
+            if needs_header {
+                let _ = writeln!(f, "timestamp,smoothed_rri,raw_rri,trend,label,delta,rsi,vwap,bb,wall");
+            }
+            let _ = writeln!(
+                f,
+                "{},{:.1},{:.1},{},{},{:.1},{:.1},{:.1},{:.2},{:.1}",
+                timestamp, self.smoothed_rri, raw_rri, trend, label,
+                delta_score, rsi_score, vwap_score, bb_score, wall_score
+            );
+        }
+        self.rri_write_count += 1;
+        if self.rri_write_count % 100 == 0 {
+            self.prune_rri_log();
+        }
+    }
+
+    /// Remove log entries older than `log_retention_hours` from the CSV log file.
+    fn prune_rri_log(&self) {
+        let path = &self.log_file;
+        let file = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        let reader = std::io::BufReader::new(file);
+        let lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
+        if lines.len() < 2 {
+            return;
+        }
+        let cutoff = Utc::now() - chrono::TimeDelta::hours(self.log_retention_hours as i64);
+        let header = lines[0].clone();
+        let retained: Vec<&String> = lines[1..]
+            .iter()
+            .filter(|line| {
+                let ts_str = line.split(',').next().unwrap_or("");
+                chrono::DateTime::parse_from_rfc3339(ts_str)
+                    .map(|dt| dt.with_timezone(&Utc) >= cutoff)
+                    .unwrap_or(true)
+            })
+            .collect();
+        if let Ok(f) = std::fs::File::create(path) {
+            let mut writer = std::io::BufWriter::new(f);
+            let _ = writeln!(writer, "{}", header);
+            for line in retained {
+                let _ = writeln!(writer, "{}", line);
+            }
+        }
     }
 }
 
@@ -726,14 +842,24 @@ async fn connect_ws_coinbase() -> tokio_tungstenite::WebSocketStream<
 #[tokio::main]
 async fn main() {
     println!("🚀 Reversal Terminator — BTC/USD monitor starting…");
+
+    // Load configuration from config.json, falling back to defaults if missing.
+    let config = std::fs::read_to_string("config.json")
+        .ok()
+        .and_then(|s| serde_json::from_str::<Config>(&s).ok())
+        .unwrap_or_default();
+
+    println!("📋 Config: rri_alpha={} | tick={}s | rri_every={}t | log={} | retention={}h",
+        config.rri_alpha, config.tick_interval_secs, config.rri_check_every_n_ticks,
+        config.log_file, config.log_retention_hours);
     println!("   Connecting to Coinbase Exchange WebSocket…\n");
 
     let ws = connect_ws_coinbase().await;
     let mut stream = ws.fuse();
 
-    let mut state = AppState::new();
-    // 5-second tick drives the status line; no initial alignment sleep needed.
-    let mut ticker = tokio::time::interval(Duration::from_secs(5));
+    let tick_secs = config.tick_interval_secs;
+    let mut state = AppState::new(&config);
+    let mut ticker = tokio::time::interval(Duration::from_secs(tick_secs));
 
     println!("📡 Streaming live data — watching for reversals…\n");
 
@@ -751,7 +877,7 @@ async fn main() {
                             }
                             Ok(CoinbaseMessage::L2Update { changes }) => {
                                 state.sell_wall.apply_changes(&changes);
-                                // Sell wall signal is evaluated at the 15-second
+                                // Sell wall signal is evaluated at the RRI
                                 // checkpoint, not on every depth update.
                             }
                             _ => {}
