@@ -537,6 +537,10 @@ struct AppState {
     rolling_trades: VecDeque<TimedTrade>,
     /// Most recently calculated 60-second rolling average (kept for "Stale" display).
     rolling_60s_avg: f64,
+    /// Most recently calculated 5-second rolling average.
+    rolling_5s_avg: f64,
+    /// Previous tick's 5-second rolling average, for inter-line delta.
+    prev_5s_avg: f64,
     /// Price at the previous tick, for Δ calculation.
     prev_tick_price: f64,
     /// EMA-smoothed RRI value displayed to the user.
@@ -575,6 +579,8 @@ impl AppState {
             tick_count: 0,
             rolling_trades: VecDeque::new(),
             rolling_60s_avg: 0.0,
+            rolling_5s_avg: 0.0,
+            prev_5s_avg: 0.0,
             prev_tick_price: 0.0,
             smoothed_rri: 0.0,
             previous_smoothed_rri: 0.0,
@@ -656,6 +662,30 @@ impl AppState {
             format_usd(self.rolling_60s_avg)
         };
 
+        // Calculate the 5-second volume-weighted average.
+        let cutoff_5s_ms = now_ms.saturating_sub(5_000);
+        let (pv_5s, vol_5s) = self.rolling_trades.iter()
+            .filter(|t| t.timestamp_ms >= cutoff_5s_ms)
+            .fold((0.0f64, 0.0f64), |(pv, v), t| (pv + t.price * t.volume, v + t.volume));
+
+        let avg_5s_str = if vol_5s > 0.0 {
+            self.rolling_5s_avg = pv_5s / vol_5s;
+            format_usd(self.rolling_5s_avg)
+        } else if self.rolling_5s_avg > 0.0 {
+            format!("{} ⚠️ Stale", format_usd(self.rolling_5s_avg))
+        } else {
+            "N/A".to_string()
+        };
+
+        // Inter-line delta: change in 5s avg since the previous tick.
+        let delta_5s_str = if self.prev_5s_avg > 0.0 && self.rolling_5s_avg > 0.0 {
+            let delta = self.rolling_5s_avg - self.prev_5s_avg;
+            format!(" (Δ: {})", format_usd_change(delta))
+        } else {
+            String::new()
+        };
+        self.prev_5s_avg = self.rolling_5s_avg;
+
         let delta_str = if self.prev_tick_price > 0.0 {
             let delta_tick = self.current_price - self.prev_tick_price;
             format!(" | Δ{}s: {}", self.tick_interval_secs, format_usd_change(delta_tick))
@@ -667,7 +697,7 @@ impl AppState {
 
         // Price line — printed every 5 seconds.
         output.push(format!(
-            "💰 [{ts}] BTC: {} | 60s Avg: {avg_str}{delta_str}",
+            "💰 [{ts}] BTC: {} | 5s Avg: {avg_5s_str}{delta_5s_str} | 60s Avg: {avg_str}{delta_str}",
             format_usd(self.current_price)
         ));
 
