@@ -6,5 +6,6 @@
   "log_retention_hours": 12,
   "kalshi_api_key": "",
   "kalshi_api_secret": "",
-  "kalshi_event_ticker": "KXBTCD"
+  "kalshi_api_secret_file": "",
+  "kalshi_series_ticker": "KXBTC"
 }
