@@ -32,7 +32,7 @@ Copy `config.example.json` to `config.json` and edit to your preferences:
   "log_retention_hours": 12,
   "kalshi_api_key": "",
   "kalshi_api_secret": "",
-  "kalshi_event_ticker": "KXBTCD"
+  "kalshi_event_ticker": "KXBTC15M"
 }
 ```
 
@@ -48,7 +48,7 @@ Copy `config.example.json` to `config.json` and edit to your preferences:
 | `log_retention_hours` | `12` | Prune log entries older than this |
 | `kalshi_api_key` | `""` | Kalshi account email. Leave empty to disable Kalshi |
 | `kalshi_api_secret` | `""` | Kalshi account password. Leave empty to disable Kalshi |
-| `kalshi_event_ticker` | `"KXBTCD"` | Kalshi event ticker prefix for 15-minute BTC contracts |
+| `kalshi_event_ticker` | `"KXBTC15M"` | Kalshi event ticker prefix for 15-minute BTC contracts |
 
 ---
 
