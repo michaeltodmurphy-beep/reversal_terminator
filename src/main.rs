@@ -33,13 +33,13 @@ struct Config {
     /// When set, takes precedence over `kalshi_api_secret`.
     #[serde(default)]
     kalshi_api_secret_file: String,
-    /// Kalshi series ticker for BTC contracts (e.g. "KXBTC").
+    /// Kalshi series ticker for BTC contracts (e.g. "KXBTC15M").
     #[serde(default = "default_kalshi_series_ticker", alias = "kalshi_event_ticker")]
     kalshi_series_ticker: String,
 }
 
 fn default_kalshi_series_ticker() -> String {
-    "KXBTC".to_string()
+    "KXBTC15M".to_string()
 }
 
 impl Default for Config {
@@ -920,7 +920,7 @@ fn kalshi_sign(private_key_pem: &str, timestamp: &str, method: &str, path: &str)
         .map_err(|e| eprintln!("Kalshi: failed to parse private key: {e}"))
         .ok()?;
 
-    let signing_key = SigningKey::<Sha256>::new_with_salt_len(private_key, 32);
+    let signing_key = SigningKey::<Sha256>::new(private_key);
     let message = format!("{timestamp}{method}{path}");
 
     let mut rng = rand::thread_rng();
