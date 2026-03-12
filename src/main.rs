@@ -897,6 +897,7 @@ const KALSHI_REST_BASE: &str = "https://api.elections.kalshi.com/trade-api/v2";
 /// The message is `timestamp_str + method + path`.  Returns a base64-encoded
 /// signature, or `None` if the private key cannot be parsed or signing fails.
 fn kalshi_sign(private_key_pem: &str, timestamp: &str, method: &str, path: &str) -> Option<String> {
+    use rsa::pkcs1::DecodeRsaPrivateKey;
     use rsa::pkcs8::DecodePrivateKey;
     use rsa::pss::SigningKey;
     use rsa::signature::{RandomizedSigner, SignatureEncoding};
@@ -906,7 +907,11 @@ fn kalshi_sign(private_key_pem: &str, timestamp: &str, method: &str, path: &str)
     // newlines (common when serialised as a single-line JSON string).
     let pem = private_key_pem.replace("\\n", "\n");
 
+    // Try PKCS#8 first (`-----BEGIN PRIVATE KEY-----`), then fall back to
+    // PKCS#1 (`-----BEGIN RSA PRIVATE KEY-----`) which is the format that
+    // Kalshi generates.
     let private_key = rsa::RsaPrivateKey::from_pkcs8_pem(&pem)
+        .or_else(|_| rsa::RsaPrivateKey::from_pkcs1_pem(&pem))
         .map_err(|e| eprintln!("Kalshi: failed to parse private key: {e}"))
         .ok()?;
 
