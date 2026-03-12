@@ -892,49 +892,59 @@ impl AppState {
 const KALSHI_WS_URL: &str = "wss://api.elections.kalshi.com/trade-api/ws/v2";
 const KALSHI_REST_BASE: &str = "https://api.elections.kalshi.com/trade-api/v2";
 
-/// Authenticate with the Kalshi REST API using email/password credentials.
-/// Returns a session token on success.
-async fn kalshi_login(api_key: &str, api_secret: &str) -> Option<String> {
-    let client = reqwest::Client::new();
-    let body = serde_json::json!({
-        "email":    api_key,
-        "password": api_secret,
-    });
-    let url = format!("{KALSHI_REST_BASE}/login");
-    match client.post(&url).json(&body).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            match resp.json::<serde_json::Value>().await {
-                Ok(v) => v["token"].as_str().map(|s| s.to_string()),
-                Err(e) => {
-                    eprintln!("Kalshi login parse error: {e}");
-                    None
-                }
-            }
-        }
-        Ok(resp) => {
-            eprintln!("Kalshi login failed: HTTP {}", resp.status());
-            None
-        }
-        Err(e) => {
-            eprintln!("Kalshi login request error: {e}");
-            None
-        }
-    }
+/// Sign a Kalshi API request using RSA-PSS SHA-256.
+///
+/// The message is `timestamp_str + method + path`.  Returns a base64-encoded
+/// signature, or `None` if the private key cannot be parsed or signing fails.
+fn kalshi_sign(private_key_pem: &str, timestamp: &str, method: &str, path: &str) -> Option<String> {
+    use rsa::pkcs8::DecodePrivateKey;
+    use rsa::pss::SigningKey;
+    use rsa::signature::{RandomizedSigner, SignatureEncoding};
+    use sha2::Sha256;
+
+    // The PEM stored in config.json may use literal `\n` instead of real
+    // newlines (common when serialised as a single-line JSON string).
+    let pem = private_key_pem.replace("\\n", "\n");
+
+    let private_key = rsa::RsaPrivateKey::from_pkcs8_pem(&pem)
+        .map_err(|e| eprintln!("Kalshi: failed to parse private key: {e}"))
+        .ok()?;
+
+    let signing_key = SigningKey::<Sha256>::new_with_salt_len(private_key, 32);
+    let message = format!("{timestamp}{method}{path}");
+
+    let mut rng = rand::thread_rng();
+    let sig = signing_key
+        .sign_with_rng(&mut rng, message.as_bytes())
+        .to_bytes();
+
+    Some(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &sig))
 }
 
 /// Query the Kalshi REST API to find the nearest ATM 15-minute BTC contract
 /// expiring in the current (or next) 15-minute window.  Returns the market
 /// ticker on success.
 async fn kalshi_find_atm_contract(
-    token: &str,
+    api_key: &str,
+    api_secret: &str,
     event_ticker: &str,
     current_btc_price: f64,
 ) -> Option<String> {
+    let path = format!("/trade-api/v2/markets?event_ticker={event_ticker}&status=open&limit=100");
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string();
+    let signature = kalshi_sign(api_secret, &timestamp, "GET", &path)?;
+
     let client = reqwest::Client::new();
     let url = format!("{KALSHI_REST_BASE}/markets?event_ticker={event_ticker}&status=open&limit=100");
     let resp = client
         .get(&url)
-        .header("Authorization", format!("Bearer {token}"))
+        .header("KALSHI-ACCESS-KEY", api_key)
+        .header("KALSHI-ACCESS-SIGNATURE", signature)
+        .header("KALSHI-ACCESS-TIMESTAMP", &timestamp)
         .send()
         .await
         .ok()?;
@@ -998,25 +1008,11 @@ async fn run_kalshi_task(
     state: Arc<Mutex<KalshiState>>,
     current_price_ref: Arc<Mutex<f64>>,
 ) {
-    // Outer loop: re-authenticate and reconnect from scratch on any hard failure.
+    // Outer loop: reconnect from scratch on any hard failure.
     loop {
-        // Authenticate.
-        let token = match kalshi_login(&api_key, &api_secret).await {
-            Some(t) => t,
-            None => {
-                eprintln!("Kalshi auth failed, retrying in 30s…");
-                {
-                    let mut ks = state.lock().unwrap();
-                    ks.connected = false;
-                }
-                tokio::time::sleep(Duration::from_secs(30)).await;
-                continue;
-            }
-        };
-
         // Find ATM contract.
         let btc_price = { *current_price_ref.lock().unwrap() };
-        let ticker = match kalshi_find_atm_contract(&token, &event_ticker, btc_price).await {
+        let ticker = match kalshi_find_atm_contract(&api_key, &api_secret, &event_ticker, btc_price).await {
             Some(t) => t,
             None => {
                 eprintln!("Kalshi: no active contract found, retrying in 60s…");
@@ -1054,10 +1050,27 @@ async fn run_kalshi_task(
         let (mut sink, mut stream) = ws.split();
 
         // Authenticate over the WebSocket connection.
+        let ws_path = "/trade-api/ws/v2";
+        let ws_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let ws_ts_str = ws_ts.to_string();
+        let ws_signature = match kalshi_sign(&api_secret, &ws_ts_str, "GET", ws_path) {
+            Some(s) => s,
+            None => {
+                eprintln!("Kalshi WS: failed to sign auth, reconnecting…");
+                continue;
+            }
+        };
         let auth_msg = serde_json::json!({
             "id": 1,
             "cmd": "auth",
-            "params": { "token": token }
+            "params": {
+                "api_key": api_key,
+                "timestamp": ws_ts,
+                "signature": ws_signature
+            }
         });
         if sink.send(Message::Text(auth_msg.to_string())).await.is_err() {
             eprintln!("Kalshi WS auth send failed, reconnecting…");
@@ -1112,7 +1125,7 @@ async fn run_kalshi_task(
                     // Check whether a newer ATM contract has become active.
                     let btc = { *current_price_ref.lock().unwrap() };
                     if btc > 0.0 {
-                        if let Some(new_ticker) = kalshi_find_atm_contract(&token, &event_ticker, btc).await {
+                        if let Some(new_ticker) = kalshi_find_atm_contract(&api_key, &api_secret, &event_ticker, btc).await {
                             let current = {
                                 let ks = state.lock().unwrap();
                                 ks.active_ticker.clone()
