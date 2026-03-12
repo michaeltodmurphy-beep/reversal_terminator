@@ -26,16 +26,20 @@ struct Config {
     /// Kalshi API key (email). Leave empty to disable Kalshi integration.
     #[serde(default)]
     kalshi_api_key: String,
-    /// Kalshi API secret (password). Leave empty to disable Kalshi integration.
+    /// Kalshi API secret (RSA private key PEM inline). Leave empty to disable Kalshi integration.
     #[serde(default)]
     kalshi_api_secret: String,
-    /// Kalshi event ticker prefix for 15-minute BTC contracts (e.g. "KXBTCD").
-    #[serde(default = "default_kalshi_event_ticker")]
-    kalshi_event_ticker: String,
+    /// Path to a file containing the Kalshi RSA private key in PEM format.
+    /// When set, takes precedence over `kalshi_api_secret`.
+    #[serde(default)]
+    kalshi_api_secret_file: String,
+    /// Kalshi series ticker for BTC contracts (e.g. "KXBTC").
+    #[serde(default = "default_kalshi_series_ticker", alias = "kalshi_event_ticker")]
+    kalshi_series_ticker: String,
 }
 
-fn default_kalshi_event_ticker() -> String {
-    "KXBTCD".to_string()
+fn default_kalshi_series_ticker() -> String {
+    "KXBTC".to_string()
 }
 
 impl Default for Config {
@@ -48,7 +52,8 @@ impl Default for Config {
             log_retention_hours: 12,
             kalshi_api_key: String::new(),
             kalshi_api_secret: String::new(),
-            kalshi_event_ticker: default_kalshi_event_ticker(),
+            kalshi_api_secret_file: String::new(),
+            kalshi_series_ticker: default_kalshi_series_ticker(),
         }
     }
 }
@@ -932,19 +937,17 @@ fn kalshi_sign(private_key_pem: &str, timestamp: &str, method: &str, path: &str)
 async fn kalshi_find_atm_contract(
     api_key: &str,
     api_secret: &str,
-    event_ticker: &str,
+    series_ticker: &str,
     current_btc_price: f64,
 ) -> Option<String> {
-    let path = format!("/trade-api/v2/markets?event_ticker={event_ticker}&status=open&limit=100");
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .to_string();
-    let signature = kalshi_sign(api_secret, &timestamp, "GET", &path)?;
+    // Sign only the bare path — Kalshi's signature spec covers
+    // `{timestamp}{METHOD}{path}` without query parameters.
+    let bare_path = "/trade-api/v2/markets";
+    let timestamp = Utc::now().timestamp_millis().to_string();
+    let signature = kalshi_sign(api_secret, &timestamp, "GET", bare_path)?;
 
     let client = reqwest::Client::new();
-    let url = format!("{KALSHI_REST_BASE}/markets?event_ticker={event_ticker}&status=open&limit=100");
+    let url = format!("{KALSHI_REST_BASE}/markets?series_ticker={series_ticker}&status=open&limit=100");
     let resp = client
         .get(&url)
         .header("KALSHI-ACCESS-KEY", api_key)
@@ -1009,7 +1012,7 @@ async fn kalshi_find_atm_contract(
 async fn run_kalshi_task(
     api_key: String,
     api_secret: String,
-    event_ticker: String,
+    series_ticker: String,
     state: Arc<Mutex<KalshiState>>,
     current_price_ref: Arc<Mutex<f64>>,
 ) {
@@ -1017,7 +1020,7 @@ async fn run_kalshi_task(
     loop {
         // Find ATM contract.
         let btc_price = { *current_price_ref.lock().unwrap() };
-        let ticker = match kalshi_find_atm_contract(&api_key, &api_secret, &event_ticker, btc_price).await {
+        let ticker = match kalshi_find_atm_contract(&api_key, &api_secret, &series_ticker, btc_price).await {
             Some(t) => t,
             None => {
                 eprintln!("Kalshi: no active contract found, retrying in 60s…");
@@ -1130,7 +1133,7 @@ async fn run_kalshi_task(
                     // Check whether a newer ATM contract has become active.
                     let btc = { *current_price_ref.lock().unwrap() };
                     if btc > 0.0 {
-                        if let Some(new_ticker) = kalshi_find_atm_contract(&api_key, &api_secret, &event_ticker, btc).await {
+                        if let Some(new_ticker) = kalshi_find_atm_contract(&api_key, &api_secret, &series_ticker, btc).await {
                             let current = {
                                 let ks = state.lock().unwrap();
                                 ks.active_ticker.clone()
@@ -1245,7 +1248,8 @@ async fn main() {
         .and_then(|s| serde_json::from_str::<Config>(&s).ok())
         .unwrap_or_default();
 
-    let kalshi_enabled = !config.kalshi_api_key.is_empty() && !config.kalshi_api_secret.is_empty();
+    let kalshi_enabled = !config.kalshi_api_key.is_empty()
+        && (!config.kalshi_api_secret.is_empty() || !config.kalshi_api_secret_file.is_empty());
 
     println!(
         "📋 Config: rri_alpha={} | tick={}s | rri_every={}t | log={} | retention={}h | kalshi={}",
@@ -1270,13 +1274,32 @@ async fn main() {
 
     // Kalshi shared state + background task.
     let kalshi_state: Option<Arc<Mutex<KalshiState>>> = if kalshi_enabled {
+        // Resolve the RSA private key: prefer a file path over the inline string.
+        let kalshi_secret = if !config.kalshi_api_secret_file.is_empty() {
+            match std::fs::read_to_string(&config.kalshi_api_secret_file) {
+                Ok(pem) => pem,
+                Err(e) => {
+                    eprintln!(
+                        "Kalshi: failed to read key file '{}': {e}; falling back to inline secret",
+                        config.kalshi_api_secret_file
+                    );
+                    if config.kalshi_api_secret.is_empty() {
+                        eprintln!("Kalshi: inline kalshi_api_secret is also empty — Kalshi will be non-functional");
+                    }
+                    config.kalshi_api_secret.clone()
+                }
+            }
+        } else {
+            config.kalshi_api_secret.clone()
+        };
+
         let ks = Arc::new(Mutex::new(KalshiState::new()));
         let ks_clone = ks.clone();
         let price_clone = shared_btc_price.clone();
         tokio::spawn(run_kalshi_task(
             config.kalshi_api_key.clone(),
-            config.kalshi_api_secret.clone(),
-            config.kalshi_event_ticker.clone(),
+            kalshi_secret,
+            config.kalshi_series_ticker.clone(),
             ks_clone,
             price_clone,
         ));
