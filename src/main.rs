@@ -1154,12 +1154,12 @@ async fn run_kalshi_task(
 
         let (mut sink, mut stream) = ws.split();
 
-        // Subscribe to the orderbook for the active contract.
+        // Subscribe to the ticker channel for the active contract.
         let sub_msg = serde_json::json!({
             "id": 2,
             "cmd": "subscribe",
             "params": {
-                "channels": ["orderbook_delta"],
+                "channels": ["ticker"],
                 "market_tickers": [ticker]
             }
         });
@@ -1184,6 +1184,10 @@ async fn run_kalshi_task(
                     match msg {
                         Some(Ok(Message::Text(text))) => {
                             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                                let msg_type = v["type"].as_str().unwrap_or("unknown");
+                                if msg_type != "ticker" {
+                                    eprintln!("Kalshi WS msg type: {msg_type}");
+                                }
                                 kalshi_handle_message(&v, &state);
                             }
                         }
@@ -1229,16 +1233,7 @@ async fn run_kalshi_task(
 /// Parse a Kalshi WebSocket message and update the shared state with the
 /// latest YES/NO bid prices.
 fn kalshi_handle_message(msg: &serde_json::Value, state: &Arc<Mutex<KalshiState>>) {
-    // Kalshi orderbook_delta messages carry bid prices in `yes` and `no` fields
-    // within the `msg` payload.  As of March 2026 the API sends prices as
-    // dollar-denominated floats (0.0–1.0); older API versions sent cents
-    // (0–100).  We detect the scale and normalise to dollars in both cases.
     let msg_type = msg["type"].as_str().unwrap_or("");
-    if msg_type != "orderbook_delta" && msg_type != "orderbook_snapshot" {
-        return;
-    }
-
-    let payload = &msg["msg"];
 
     /// Convert a raw price value to dollars.  Values already in the 0–1 range
     /// are returned as-is; values above 1 are assumed to be cents and divided
@@ -1246,6 +1241,32 @@ fn kalshi_handle_message(msg: &serde_json::Value, state: &Arc<Mutex<KalshiState>
     fn to_dollars(raw: f64) -> f64 {
         if raw > 1.0 { raw / 100.0 } else { raw }
     }
+
+    // Handle ticker messages (primary channel for YES/NO bid prices).
+    // The ticker channel sends flat fields `yes_bid` and `no_bid` in the `msg`
+    // payload as cent values (0–100); the `to_dollars` helper normalises both
+    // integer cents and fractional dollar representations to the 0.0–1.0 range.
+    if msg_type == "ticker" {
+        let payload = &msg["msg"];
+        let yes_bid = flex_parse_f64(&payload["yes_bid"]).map(to_dollars);
+        let no_bid = flex_parse_f64(&payload["no_bid"]).map(to_dollars);
+        let mut ks = state.lock().unwrap();
+        if let Some(y) = yes_bid {
+            ks.yes_bid = y;
+        }
+        if let Some(n) = no_bid {
+            ks.no_bid = n;
+        }
+        return;
+    }
+
+    // Fallback: handle orderbook_delta / orderbook_snapshot messages in case
+    // Kalshi ever sends those alongside the ticker channel.
+    if msg_type != "orderbook_delta" && msg_type != "orderbook_snapshot" {
+        return;
+    }
+
+    let payload = &msg["msg"];
 
     // Extract best YES bid.
     let yes_bid = payload["yes"]
