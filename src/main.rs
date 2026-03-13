@@ -894,8 +894,8 @@ impl AppState {
 
 // ── Kalshi WebSocket task ──────────────────────────────────────────────────
 
-const KALSHI_WS_URL: &str = "wss://trading-api.kalshi.com/trade-api/ws/v2";
-const KALSHI_REST_BASE: &str = "https://trading-api.kalshi.com/trade-api/v2";
+const KALSHI_WS_URL: &str = "wss://api.elections.kalshi.com/trade-api/ws/v2";
+const KALSHI_REST_BASE: &str = "https://api.elections.kalshi.com/trade-api/v2";
 
 /// Sign a Kalshi API request using RSA-PSS SHA-256.
 ///
