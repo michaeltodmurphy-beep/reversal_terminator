@@ -894,8 +894,8 @@ impl AppState {
 
 // ── Kalshi WebSocket task ──────────────────────────────────────────────────
 
-const KALSHI_WS_URL: &str = "wss://api.elections.kalshi.com/trade-api/ws/v2";
-const KALSHI_REST_BASE: &str = "https://api.elections.kalshi.com/trade-api/v2";
+const KALSHI_WS_URL: &str = "wss://trading-api.kalshi.com/trade-api/ws/v2";
+const KALSHI_REST_BASE: &str = "https://trading-api.kalshi.com/trade-api/v2";
 
 /// Sign a Kalshi API request using RSA-PSS SHA-256.
 ///
@@ -929,6 +929,11 @@ fn kalshi_sign(private_key_pem: &str, timestamp: &str, method: &str, path: &str)
         .to_bytes();
 
     Some(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &sig))
+}
+
+/// Parse a serde_json::Value that may be a JSON number or a JSON string containing a number.
+fn flex_parse_f64(val: &serde_json::Value) -> Option<f64> {
+    val.as_f64().or_else(|| val.as_str().and_then(|s| s.parse::<f64>().ok()))
 }
 
 /// Query the Kalshi REST API to find the nearest ATM 15-minute BTC contract
@@ -987,9 +992,8 @@ async fn kalshi_find_atm_contract(
         }
 
         // Use the floor_strike (lower bound of the price range) as the ATM proxy.
-        let strike = market["floor_strike"]
-            .as_f64()
-            .or_else(|| market["cap_strike"].as_f64())
+        let strike = flex_parse_f64(&market["floor_strike"])
+            .or_else(|| flex_parse_f64(&market["cap_strike"]))
             .unwrap_or(0.0);
 
         if strike == 0.0 {
@@ -1175,8 +1179,8 @@ fn kalshi_handle_message(msg: &serde_json::Value, state: &Arc<Mutex<KalshiState>
         .and_then(|arr| {
             arr.iter()
                 .filter_map(|entry| {
-                    let price = entry[0].as_f64()?;
-                    let size = entry[1].as_f64().unwrap_or(0.0);
+                    let price = flex_parse_f64(&entry[0])?;
+                    let size = flex_parse_f64(&entry[1]).unwrap_or(0.0);
                     if size > 0.0 { Some(price) } else { None }
                 })
                 .reduce(f64::max)
@@ -1188,8 +1192,8 @@ fn kalshi_handle_message(msg: &serde_json::Value, state: &Arc<Mutex<KalshiState>
         .and_then(|arr| {
             arr.iter()
                 .filter_map(|entry| {
-                    let price = entry[0].as_f64()?;
-                    let size = entry[1].as_f64().unwrap_or(0.0);
+                    let price = flex_parse_f64(&entry[0])?;
+                    let size = flex_parse_f64(&entry[1]).unwrap_or(0.0);
                     if size > 0.0 { Some(price) } else { None }
                 })
                 .reduce(f64::max)
