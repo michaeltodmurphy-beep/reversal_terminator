@@ -1244,12 +1244,26 @@ fn kalshi_handle_message(msg: &serde_json::Value, state: &Arc<Mutex<KalshiState>
 
     // Handle ticker messages (primary channel for YES/NO bid prices).
     // Kalshi v2 WebSocket ticker messages nest the price data under the "msg"
-    // sub-object with field names `yes_bid_dollars` / `no_bid_dollars` (strings
-    // in the 0.0–1.0 range, already in dollars).
+    // sub-object with field names `yes_bid_dollars` / `yes_ask_dollars` (strings
+    // in the 0.0–1.0 range, already in dollars).  The ticker channel often
+    // omits `no_bid_dollars`/`no_ask_dollars`, so we derive NO prices as
+    // complements of YES prices (YES + NO = $1.00), matching the approach used
+    // by the reference Kalshi-crypto-trading-bot implementation.
     if msg_type == "ticker" {
+        // Debug: log the first few raw ticker payloads to verify field names.
+        static TICKER_LOG_COUNT: std::sync::atomic::AtomicU32 =
+            std::sync::atomic::AtomicU32::new(0);
+        if TICKER_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
+            eprintln!("Kalshi ticker raw: {}", msg);
+        }
         let payload = &msg["msg"];
         let yes_bid = flex_parse_f64(&payload["yes_bid_dollars"]);
-        let no_bid = flex_parse_f64(&payload["no_bid_dollars"]);
+        let yes_ask = flex_parse_f64(&payload["yes_ask_dollars"]);
+        // Derive NO prices as complements of YES prices (YES + NO = $1.00).
+        // Kalshi's ticker channel often omits no_bid/no_ask; this derivation
+        // matches the approach used by the working Kalshi-crypto-trading-bot.
+        let no_bid = yes_ask.map(|ya| 1.0 - ya)
+            .or_else(|| flex_parse_f64(&payload["no_bid_dollars"]));
         let mut ks = state.lock().unwrap();
         if let Some(y) = yes_bid {
             ks.yes_bid = y;
