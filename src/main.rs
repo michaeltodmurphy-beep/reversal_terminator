@@ -1243,13 +1243,12 @@ fn kalshi_handle_message(msg: &serde_json::Value, state: &Arc<Mutex<KalshiState>
     }
 
     // Handle ticker messages (primary channel for YES/NO bid prices).
-    // The ticker channel sends flat fields `yes_bid` and `no_bid` in the `msg`
-    // payload as cent values (0–100); the `to_dollars` helper normalises both
-    // integer cents and fractional dollar representations to the 0.0–1.0 range.
+    // The Kalshi v2 ticker channel sends flat messages — `yes_bid`, `no_bid`,
+    // etc. are top-level fields, not nested under a `"msg"` sub-object.
+    // Values are cent integers (0–100); `to_dollars` normalises to 0.0–1.0.
     if msg_type == "ticker" {
-        let payload = &msg["msg"];
-        let yes_bid = flex_parse_f64(&payload["yes_bid"]).map(to_dollars);
-        let no_bid = flex_parse_f64(&payload["no_bid"]).map(to_dollars);
+        let yes_bid = flex_parse_f64(&msg["yes_bid"]).map(to_dollars);
+        let no_bid = flex_parse_f64(&msg["no_bid"]).map(to_dollars);
         let mut ks = state.lock().unwrap();
         if let Some(y) = yes_bid {
             ks.yes_bid = y;
@@ -1266,7 +1265,7 @@ fn kalshi_handle_message(msg: &serde_json::Value, state: &Arc<Mutex<KalshiState>
         return;
     }
 
-    let payload = &msg["msg"];
+    let payload = &msg;
 
     // Extract best YES bid.
     let yes_bid = payload["yes"]
