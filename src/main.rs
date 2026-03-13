@@ -945,14 +945,15 @@ async fn kalshi_find_atm_contract(
     series_ticker: &str,
     current_btc_price: f64,
 ) -> Option<String> {
-    // Sign only the bare path — Kalshi's signature spec covers
-    // `{timestamp}{METHOD}{path}` without query parameters.
-    let bare_path = "/trade-api/v2/markets";
+    // Sign the full path including query parameters — Kalshi's updated API
+    // spec requires `{timestamp_ms}{METHOD}{full_path_with_query_params}`.
+    let query = format!("series_ticker={series_ticker}&status=open&limit=100");
+    let full_path = format!("/trade-api/v2/markets?{query}");
     let timestamp = Utc::now().timestamp_millis().to_string();
-    let signature = kalshi_sign(api_secret, &timestamp, "GET", bare_path)?;
+    let signature = kalshi_sign(api_secret, &timestamp, "GET", &full_path)?;
 
     let client = reqwest::Client::new();
-    let url = format!("{KALSHI_REST_BASE}/markets?series_ticker={series_ticker}&status=open&limit=100");
+    let url = format!("{KALSHI_REST_BASE}/markets?{query}");
     let resp = client
         .get(&url)
         .header("KALSHI-ACCESS-KEY", api_key)
@@ -1046,7 +1047,7 @@ async fn run_kalshi_task(
 
         // Connect WebSocket.
         let ws_url = Url::parse(KALSHI_WS_URL).expect("invalid Kalshi WS URL");
-        let ws = match connect_async(ws_url).await {
+        let ws = match connect_async(ws_url.as_str()).await {
             Ok((ws, _)) => ws,
             Err(e) => {
                 eprintln!("Kalshi WS connect failed ({e}), retrying in 10s…");
@@ -1084,7 +1085,7 @@ async fn run_kalshi_task(
                 "signature": ws_signature
             }
         });
-        if sink.send(Message::Text(auth_msg.to_string())).await.is_err() {
+        if sink.send(Message::Text(auth_msg.to_string().into())).await.is_err() {
             eprintln!("Kalshi WS auth send failed, reconnecting…");
             continue;
         }
@@ -1098,7 +1099,7 @@ async fn run_kalshi_task(
                 "market_tickers": [ticker]
             }
         });
-        if sink.send(Message::Text(sub_msg.to_string())).await.is_err() {
+        if sink.send(Message::Text(sub_msg.to_string().into())).await.is_err() {
             eprintln!("Kalshi WS subscribe send failed, reconnecting…");
             continue;
         }
@@ -1221,10 +1222,10 @@ async fn connect_ws_coinbase() -> tokio_tungstenite::WebSocketStream<
 > {
     let url = Url::parse(COINBASE_URL).expect("invalid URL");
     loop {
-        match connect_async(url.clone()).await {
+        match connect_async(url.as_str()).await {
             Ok((mut ws, _)) => {
                 println!("✅ Connected to {COINBASE_URL}");
-                match ws.send(Message::Text(SUBSCRIBE_MSG.to_string())).await {
+                match ws.send(Message::Text(SUBSCRIBE_MSG.to_string().into())).await {
                     Ok(_) => return ws,
                     Err(e) => {
                         eprintln!("⚠️  Subscribe failed ({e}), retrying in 3s …");
