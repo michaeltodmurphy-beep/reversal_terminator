@@ -1265,10 +1265,8 @@ fn kalshi_handle_message(msg: &serde_json::Value, state: &Arc<Mutex<KalshiState>
         return;
     }
 
-    let payload = &msg;
-
     // Extract best YES bid.
-    let yes_bid = payload["yes"]
+    let yes_bid = msg["yes"]
         .as_array()
         .and_then(|arr| {
             arr.iter()
@@ -1281,7 +1279,7 @@ fn kalshi_handle_message(msg: &serde_json::Value, state: &Arc<Mutex<KalshiState>
         });
 
     // Extract best NO bid.
-    let no_bid = payload["no"]
+    let no_bid = msg["no"]
         .as_array()
         .and_then(|arr| {
             arr.iter()
