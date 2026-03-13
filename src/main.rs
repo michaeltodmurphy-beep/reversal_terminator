@@ -1243,12 +1243,13 @@ fn kalshi_handle_message(msg: &serde_json::Value, state: &Arc<Mutex<KalshiState>
     }
 
     // Handle ticker messages (primary channel for YES/NO bid prices).
-    // The Kalshi v2 ticker channel sends flat messages — `yes_bid`, `no_bid`,
-    // etc. are top-level fields, not nested under a `"msg"` sub-object.
-    // Values are cent integers (0–100); `to_dollars` normalises to 0.0–1.0.
+    // Kalshi v2 WebSocket ticker messages nest the price data under the "msg"
+    // sub-object with field names `yes_bid_dollars` / `no_bid_dollars` (strings
+    // in the 0.0–1.0 range, already in dollars).
     if msg_type == "ticker" {
-        let yes_bid = flex_parse_f64(&msg["yes_bid"]).map(to_dollars);
-        let no_bid = flex_parse_f64(&msg["no_bid"]).map(to_dollars);
+        let payload = &msg["msg"];
+        let yes_bid = flex_parse_f64(&payload["yes_bid_dollars"]);
+        let no_bid = flex_parse_f64(&payload["no_bid_dollars"]);
         let mut ks = state.lock().unwrap();
         if let Some(y) = yes_bid {
             ks.yes_bid = y;
@@ -1265,8 +1266,10 @@ fn kalshi_handle_message(msg: &serde_json::Value, state: &Arc<Mutex<KalshiState>
         return;
     }
 
+    let payload = &msg["msg"];
+
     // Extract best YES bid.
-    let yes_bid = msg["yes"]
+    let yes_bid = payload["yes"]
         .as_array()
         .and_then(|arr| {
             arr.iter()
@@ -1279,7 +1282,7 @@ fn kalshi_handle_message(msg: &serde_json::Value, state: &Arc<Mutex<KalshiState>
         });
 
     // Extract best NO bid.
-    let no_bid = msg["no"]
+    let no_bid = payload["no"]
         .as_array()
         .and_then(|arr| {
             arr.iter()
