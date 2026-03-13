@@ -33,13 +33,13 @@ struct Config {
     /// When set, takes precedence over `kalshi_api_secret`.
     #[serde(default)]
     kalshi_api_secret_file: String,
-    /// Kalshi series ticker for BTC contracts (e.g. "KXBTC15M").
+    /// Kalshi series ticker for BTC contracts (e.g. "KXBTC").
     #[serde(default = "default_kalshi_series_ticker", alias = "kalshi_event_ticker")]
     kalshi_series_ticker: String,
 }
 
 fn default_kalshi_series_ticker() -> String {
-    "KXBTC15M".to_string()
+    "KXBTC".to_string()
 }
 
 impl Default for Config {
@@ -936,75 +936,141 @@ fn flex_parse_f64(val: &serde_json::Value) -> Option<f64> {
     val.as_f64().or_else(|| val.as_str().and_then(|s| s.parse::<f64>().ok()))
 }
 
-/// Query the Kalshi REST API to find the nearest ATM 15-minute BTC contract
-/// expiring in the current (or next) 15-minute window.  Returns the market
-/// ticker on success.
+/// Parse an RFC-3339 timestamp field from a JSON value, returning Unix seconds.
+fn parse_ts(val: &serde_json::Value) -> Option<i64> {
+    val.as_str()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.timestamp())
+}
+
+/// Query the Kalshi REST API to find an active BTC contract for the given
+/// series.  Returns the market ticker on success.
+///
+/// Accepts markets with status `"open"` OR `"active"` whose current time falls
+/// between `open_time` and `close_time` (falling back to `expiration_time`).
+/// If multiple candidates exist, the one whose strike is closest to the current
+/// BTC price is preferred; if no strike information is present the first active
+/// market is used.
 async fn kalshi_find_atm_contract(
     api_key: &str,
     api_secret: &str,
     series_ticker: &str,
     current_btc_price: f64,
 ) -> Option<String> {
-    // Sign the full path including query parameters — Kalshi's updated API
-    // spec requires `{timestamp_ms}{METHOD}{full_path_with_query_params}`.
-    let query = format!("series_ticker={series_ticker}&status=open&limit=100");
-    let full_path = format!("/trade-api/v2/markets?{query}");
-    let timestamp = Utc::now().timestamp_millis().to_string();
-    let signature = kalshi_sign(api_secret, &timestamp, "GET", &full_path)?;
-
     let client = reqwest::Client::new();
-    let url = format!("{KALSHI_REST_BASE}/markets?{query}");
-    let resp = client
-        .get(&url)
-        .header("KALSHI-ACCESS-KEY", api_key)
-        .header("KALSHI-ACCESS-SIGNATURE", signature)
-        .header("KALSHI-ACCESS-TIMESTAMP", &timestamp)
-        .send()
-        .await
-        .ok()?;
-
-    if !resp.status().is_success() {
-        eprintln!("Kalshi markets query failed: HTTP {}", resp.status());
-        return None;
-    }
-
-    let data: serde_json::Value = resp.json().await.ok()?;
-    let markets = data["markets"].as_array()?;
-
-    // Filter to markets that are still open and pick the one whose strike
-    // (cap_strike or floor_strike field) is closest to the current price.
     let now_ts = Utc::now().timestamp();
-    let fifteen_min_secs: i64 = 15 * 60;
+
+    // Collect candidate markets from both status queries so we don't miss
+    // markets that Kalshi returns under the "active" status label.
+    let mut all_markets: Vec<serde_json::Value> = Vec::new();
+
+    for status in &["open", "active"] {
+        // Sign the full path including query parameters — Kalshi's updated API
+        // spec requires `{timestamp_ms}{METHOD}{full_path_with_query_params}`.
+        let query = format!("series_ticker={series_ticker}&status={status}&limit=100");
+        let full_path = format!("/trade-api/v2/markets?{query}");
+        let timestamp = Utc::now().timestamp_millis().to_string();
+        let signature = match kalshi_sign(api_secret, &timestamp, "GET", &full_path) {
+            Some(s) => s,
+            None => continue,
+        };
+
+        let url = format!("{KALSHI_REST_BASE}/markets?{query}");
+        let resp = match client
+            .get(&url)
+            .header("KALSHI-ACCESS-KEY", api_key)
+            .header("KALSHI-ACCESS-SIGNATURE", &signature)
+            .header("KALSHI-ACCESS-TIMESTAMP", &timestamp)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("Kalshi markets query error ({status}): {e}");
+                continue;
+            }
+        };
+
+        if !resp.status().is_success() {
+            eprintln!("Kalshi markets query failed ({status}): HTTP {}", resp.status());
+            continue;
+        }
+
+        let data: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Kalshi markets parse error ({status}): {e}");
+                continue;
+            }
+        };
+
+        if let Some(arr) = data["markets"].as_array() {
+            all_markets.extend(arr.iter().cloned());
+        }
+    }
 
     let mut best_ticker: Option<String> = None;
     let mut best_dist = f64::MAX;
+    let mut best_exp: i64 = i64::MAX;
 
-    for market in markets {
-        // Only consider markets expiring within the current 15-minute window.
-        let exp_ts = market["expiration_time"]
-            .as_str()
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.timestamp())
-            .unwrap_or(0);
-
-        // Accept contracts expiring in the next 15 minutes.
-        if exp_ts < now_ts || exp_ts > now_ts + fifteen_min_secs {
+    for market in &all_markets {
+        // Accept markets with status "open" or "active".
+        let status = market["status"].as_str().unwrap_or("");
+        if status != "open" && status != "active" {
             continue;
         }
 
-        // Use the floor_strike (lower bound of the price range) as the ATM proxy.
+        // Determine the tradeable window using open_time and close_time
+        // (falling back to expiration_time when close_time is absent).
+        let open_ts = parse_ts(&market["open_time"]);
+        let close_ts = parse_ts(&market["close_time"])
+            .or_else(|| parse_ts(&market["expiration_time"]));
+
+        let is_tradeable = match (open_ts, close_ts) {
+            (Some(open), Some(close)) => now_ts >= open && now_ts < close,
+            (Some(open), None) => now_ts >= open,
+            (None, Some(close)) => now_ts < close,
+            (None, None) => {
+                // No time bounds available — accept the market but log a notice
+                // so unexpected behaviour is visible in the output.
+                let t = market["ticker"].as_str().unwrap_or("?");
+                eprintln!("Kalshi: market {t} has no open_time/close_time/expiration_time — treating as active");
+                true
+            }
+        };
+
+        if !is_tradeable {
+            continue;
+        }
+
+        let exp_ts = close_ts.unwrap_or(i64::MAX);
+        let ticker = match market["ticker"].as_str() {
+            Some(t) => t.to_string(),
+            None => continue,
+        };
+
+        // Prefer the market whose strike is closest to the current BTC price.
+        // If no strike fields are available, prefer the market expiring soonest.
         let strike = flex_parse_f64(&market["floor_strike"])
-            .or_else(|| flex_parse_f64(&market["cap_strike"]))
-            .unwrap_or(0.0);
+            .or_else(|| flex_parse_f64(&market["cap_strike"]));
 
-        if strike == 0.0 {
-            continue;
-        }
-
-        let dist = (strike - current_btc_price).abs();
-        if dist < best_dist {
-            best_dist = dist;
-            best_ticker = market["ticker"].as_str().map(|s| s.to_string());
+        match strike {
+            Some(s) => {
+                let dist = (s - current_btc_price).abs();
+                if dist < best_dist {
+                    best_dist = dist;
+                    best_exp = exp_ts;
+                    best_ticker = Some(ticker);
+                }
+            }
+            None => {
+                // No strike info — use this market only if we haven't found a
+                // strike-based candidate and this one expires sooner.
+                if best_dist == f64::MAX && exp_ts < best_exp {
+                    best_exp = exp_ts;
+                    best_ticker = Some(ticker);
+                }
+            }
         }
     }
 
@@ -1166,7 +1232,9 @@ async fn run_kalshi_task(
 /// latest YES/NO bid prices.
 fn kalshi_handle_message(msg: &serde_json::Value, state: &Arc<Mutex<KalshiState>>) {
     // Kalshi orderbook_delta messages carry bid prices in `yes` and `no` fields
-    // within the `msg` payload.  The prices are in cents (0–100).
+    // within the `msg` payload.  As of March 2026 the API sends prices as
+    // dollar-denominated floats (0.0–1.0); older API versions sent cents
+    // (0–100).  We detect the scale and normalise to dollars in both cases.
     let msg_type = msg["type"].as_str().unwrap_or("");
     if msg_type != "orderbook_delta" && msg_type != "orderbook_snapshot" {
         return;
@@ -1174,38 +1242,45 @@ fn kalshi_handle_message(msg: &serde_json::Value, state: &Arc<Mutex<KalshiState>
 
     let payload = &msg["msg"];
 
+    /// Convert a raw price value to dollars.  Values already in the 0–1 range
+    /// are returned as-is; values above 1 are assumed to be cents and divided
+    /// by 100.
+    fn to_dollars(raw: f64) -> f64 {
+        if raw > 1.0 { raw / 100.0 } else { raw }
+    }
+
     // Extract best YES bid.
-    let yes_bid_cents = payload["yes"]
+    let yes_bid = payload["yes"]
         .as_array()
         .and_then(|arr| {
             arr.iter()
                 .filter_map(|entry| {
                     let price = flex_parse_f64(&entry[0])?;
                     let size = flex_parse_f64(&entry[1]).unwrap_or(0.0);
-                    if size > 0.0 { Some(price) } else { None }
+                    if size > 0.0 { Some(to_dollars(price)) } else { None }
                 })
                 .reduce(f64::max)
         });
 
     // Extract best NO bid.
-    let no_bid_cents = payload["no"]
+    let no_bid = payload["no"]
         .as_array()
         .and_then(|arr| {
             arr.iter()
                 .filter_map(|entry| {
                     let price = flex_parse_f64(&entry[0])?;
                     let size = flex_parse_f64(&entry[1]).unwrap_or(0.0);
-                    if size > 0.0 { Some(price) } else { None }
+                    if size > 0.0 { Some(to_dollars(price)) } else { None }
                 })
                 .reduce(f64::max)
         });
 
     let mut ks = state.lock().unwrap();
-    if let Some(c) = yes_bid_cents {
-        ks.yes_bid = c / 100.0;
+    if let Some(c) = yes_bid {
+        ks.yes_bid = c;
     }
-    if let Some(c) = no_bid_cents {
-        ks.no_bid = c / 100.0;
+    if let Some(c) = no_bid {
+        ks.no_bid = c;
     }
 }
 
