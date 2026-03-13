@@ -895,6 +895,7 @@ impl AppState {
 // ── Kalshi WebSocket task ──────────────────────────────────────────────────
 
 const KALSHI_WS_URL: &str = "wss://api.elections.kalshi.com/trade-api/ws/v2";
+const KALSHI_WS_HOST: &str = "api.elections.kalshi.com";
 const KALSHI_REST_BASE: &str = "https://api.elections.kalshi.com/trade-api/v2";
 
 /// Sign a Kalshi API request using RSA-PSS SHA-256.
@@ -960,54 +961,51 @@ async fn kalshi_find_atm_contract(
     let client = reqwest::Client::new();
     let now_ts = Utc::now().timestamp();
 
-    // Collect candidate markets from both status queries so we don't miss
-    // markets that Kalshi returns under the "active" status label.
+    // Query only status=open; the Kalshi API does not accept status=active
+    // (returns HTTP 400).  We filter locally below.
+    // Kalshi's signature spec covers only `{timestamp_ms}{METHOD}{bare_path}`.
+    // Query parameters are sent in the URL but must NOT be included in the
+    // signed message, or Kalshi will reject the request with a 401/403.
+    let query = format!("series_ticker={series_ticker}&status=open&limit=200");
+    let bare_path = "/trade-api/v2/markets";
+    let timestamp = Utc::now().timestamp_millis().to_string();
+    let signature = match kalshi_sign(api_secret, &timestamp, "GET", bare_path) {
+        Some(s) => s,
+        None => return None,
+    };
+
+    let url = format!("{KALSHI_REST_BASE}/markets?{query}");
+    let resp = match client
+        .get(&url)
+        .header("KALSHI-ACCESS-KEY", api_key)
+        .header("KALSHI-ACCESS-SIGNATURE", &signature)
+        .header("KALSHI-ACCESS-TIMESTAMP", &timestamp)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Kalshi markets query error: {e}");
+            return None;
+        }
+    };
+
+    if !resp.status().is_success() {
+        eprintln!("Kalshi markets query failed: HTTP {}", resp.status());
+        return None;
+    }
+
+    let data: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Kalshi markets parse error: {e}");
+            return None;
+        }
+    };
+
     let mut all_markets: Vec<serde_json::Value> = Vec::new();
-
-    for status in &["open", "active"] {
-        // Kalshi's signature spec covers only `{timestamp_ms}{METHOD}{bare_path}`.
-        // Query parameters are sent in the URL but must NOT be included in the
-        // signed message, or Kalshi will reject the request with a 401/403.
-        let query = format!("series_ticker={series_ticker}&status={status}&limit=100");
-        let bare_path = "/trade-api/v2/markets";
-        let timestamp = Utc::now().timestamp_millis().to_string();
-        let signature = match kalshi_sign(api_secret, &timestamp, "GET", bare_path) {
-            Some(s) => s,
-            None => continue,
-        };
-
-        let url = format!("{KALSHI_REST_BASE}/markets?{query}");
-        let resp = match client
-            .get(&url)
-            .header("KALSHI-ACCESS-KEY", api_key)
-            .header("KALSHI-ACCESS-SIGNATURE", &signature)
-            .header("KALSHI-ACCESS-TIMESTAMP", &timestamp)
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("Kalshi markets query error ({status}): {e}");
-                continue;
-            }
-        };
-
-        if !resp.status().is_success() {
-            eprintln!("Kalshi markets query failed ({status}): HTTP {}", resp.status());
-            continue;
-        }
-
-        let data: serde_json::Value = match resp.json().await {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("Kalshi markets parse error ({status}): {e}");
-                continue;
-            }
-        };
-
-        if let Some(arr) = data["markets"].as_array() {
-            all_markets.extend(arr.iter().cloned());
-        }
+    if let Some(arr) = data["markets"].as_array() {
+        all_markets.extend(arr.iter().cloned());
     }
 
     let mut best_ticker: Option<String> = None;
@@ -1112,9 +1110,36 @@ async fn run_kalshi_task(
             ks.no_contract = false;
         }
 
-        // Connect WebSocket.
-        let ws_url = Url::parse(KALSHI_WS_URL).expect("invalid Kalshi WS URL");
-        let ws = match connect_async(ws_url.as_str()).await {
+        // Connect WebSocket with Kalshi auth headers in the HTTP upgrade request.
+        // The Kalshi WS endpoint returns 401 if auth is not in the handshake.
+        let ws_path = "/trade-api/ws/v2";
+        let ws_ts = Utc::now().timestamp_millis().to_string();
+        let ws_signature = match kalshi_sign(&api_secret, &ws_ts, "GET", ws_path) {
+            Some(s) => s,
+            None => {
+                eprintln!("Kalshi WS: failed to sign handshake, reconnecting…");
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                continue;
+            }
+        };
+
+        let ws_request = tokio_tungstenite::tungstenite::http::Request::builder()
+            .uri(KALSHI_WS_URL)
+            .header("Host", KALSHI_WS_HOST)
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header(
+                "Sec-WebSocket-Key",
+                tokio_tungstenite::tungstenite::handshake::client::generate_key(),
+            )
+            .header("KALSHI-ACCESS-KEY", &api_key)
+            .header("KALSHI-ACCESS-TIMESTAMP", &ws_ts)
+            .header("KALSHI-ACCESS-SIGNATURE", &ws_signature)
+            .body(())
+            .expect("failed to build WS request");
+
+        let ws = match connect_async(ws_request).await {
             Ok((ws, _)) => ws,
             Err(e) => {
                 eprintln!("Kalshi WS connect failed ({e}), retrying in 10s…");
@@ -1128,34 +1153,6 @@ async fn run_kalshi_task(
         };
 
         let (mut sink, mut stream) = ws.split();
-
-        // Authenticate over the WebSocket connection.
-        let ws_path = "/trade-api/ws/v2";
-        let ws_ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        let ws_ts_str = ws_ts.to_string();
-        let ws_signature = match kalshi_sign(&api_secret, &ws_ts_str, "GET", ws_path) {
-            Some(s) => s,
-            None => {
-                eprintln!("Kalshi WS: failed to sign auth, reconnecting…");
-                continue;
-            }
-        };
-        let auth_msg = serde_json::json!({
-            "id": 1,
-            "cmd": "auth",
-            "params": {
-                "api_key": api_key,
-                "timestamp": ws_ts,
-                "signature": ws_signature
-            }
-        });
-        if sink.send(Message::Text(auth_msg.to_string().into())).await.is_err() {
-            eprintln!("Kalshi WS auth send failed, reconnecting…");
-            continue;
-        }
 
         // Subscribe to the orderbook for the active contract.
         let sub_msg = serde_json::json!({
