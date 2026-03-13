@@ -965,12 +965,13 @@ async fn kalshi_find_atm_contract(
     let mut all_markets: Vec<serde_json::Value> = Vec::new();
 
     for status in &["open", "active"] {
-        // Sign the full path including query parameters — Kalshi's updated API
-        // spec requires `{timestamp_ms}{METHOD}{full_path_with_query_params}`.
+        // Kalshi's signature spec covers only `{timestamp_ms}{METHOD}{bare_path}`.
+        // Query parameters are sent in the URL but must NOT be included in the
+        // signed message, or Kalshi will reject the request with a 401/403.
         let query = format!("series_ticker={series_ticker}&status={status}&limit=100");
-        let full_path = format!("/trade-api/v2/markets?{query}");
+        let bare_path = "/trade-api/v2/markets";
         let timestamp = Utc::now().timestamp_millis().to_string();
-        let signature = match kalshi_sign(api_secret, &timestamp, "GET", &full_path) {
+        let signature = match kalshi_sign(api_secret, &timestamp, "GET", bare_path) {
             Some(s) => s,
             None => continue,
         };
